@@ -45,7 +45,7 @@ app.*.map.json
 /android/app/release
 
 # Firebase config
-google-services.json
+android/app/google-services.json
 GoogleService-Info.plist
 
 # API keys and secrets
