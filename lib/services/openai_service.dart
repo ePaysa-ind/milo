@@ -39,6 +39,17 @@ class OpenAIService {
   final Duration _initialBackoff = Duration(seconds: 1);
   final Dio _dio = Dio(); // Initialize the Dio object
 
+  // Available TTS models - ordered by preference for fallback
+  static const List<String> _availableTTSModels = [
+    'tts-1',        // Standard quality - most reliable
+    'tts-1-1106',   // Standard quality - newer version
+    'tts-1-hd',     // High-def quality
+    'tts-1-hd-1106' // High-def quality - newer version
+  ];
+
+  // Feature flags
+  bool _ttsEnabled = true; // Can be disabled if TTS is not working
+
   // Create a unique session ID for tracking API calls
   final String _sessionId = _generateSessionId();
 
@@ -59,7 +70,17 @@ class OpenAIService {
 
     if (_apiKey.isEmpty) {
       AdvancedLogger.error(_tag, 'API key is empty! API calls will fail');
+      _ttsEnabled = false; // Disable TTS if API key is empty
     }
+  }
+
+  // Getter for TTS enabled status
+  bool get isTTSEnabled => _ttsEnabled;
+
+  // Setter to enable/disable TTS
+  void setTTSEnabled(bool enabled) {
+    _ttsEnabled = enabled;
+    AdvancedLogger.info(_tag, 'TTS feature ${enabled ? 'enabled' : 'disabled'}');
   }
 
   // Sanitize and secure sensitive content for logging
@@ -835,82 +856,181 @@ class OpenAIService {
     }
   }
 
-  // Improved TTS with better error handling and fallbacks
+  // Improved TTS with better error handling, fallbacks, and model selection
   Future<File?> textToSpeech(String text, {
     TTSVoice voice = TTSVoice.alloy,
     double? speed,
-    bool useAdvancedModel = true,
+    bool useHighQuality = false, // Changed parameter name for clarity
   }) async {
-    try {
-      AdvancedLogger.info(_tag, 'Starting text-to-speech conversion',
-          data: {'textLength': text.length, 'voice': voice.value});
-
-      // Create a temporary file to save the audio
-      final directory = await getTemporaryDirectory();
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final filePath = '${directory.path}/tts_${timestamp}.mp3';
-
-      // Create payload for the API request
-      final Map<String, dynamic> payload = {
-        'model': useAdvancedModel ? 'tts-1' : 'tts-1-hd',
-        'input': text,
-        'voice': voice.value,
-      };
-
-      // Fix: Convert double to String for the speed parameter
-      if (speed != null) {
-        // Convert the double to a string to ensure proper typing
-        payload['speed'] = speed.toString();
-        AdvancedLogger.info(_tag, 'Setting TTS speed', data: {'speed': speed});
-      }
-
-      // Make API request to OpenAI TTS endpoint
-      final response = await _dio.post(
-        '$_baseUrl/audio/speech',
-        options: Options(
-          headers: {
-            'Authorization': 'Bearer $_apiKey',
-            'Content-Type': 'application/json',
-          },
-          responseType: ResponseType.bytes,
-        ),
-        data: payload,
-      );
-
-      // Save the audio data to a file
-      if (response.statusCode == 200 && response.data != null) {
-        final file = File(filePath);
-        await file.writeAsBytes(response.data);
-
-        AdvancedLogger.info(_tag, 'Text-to-speech conversion successful',
-            data: {'filePath': filePath, 'fileSize': response.data.length});
-
-        return file;
-      } else {
-        AdvancedLogger.error(_tag, 'Error in TTS API response',
-            data: {'statusCode': response.statusCode});
-        return null;
-      }
-    } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error in text-to-speech conversion',
-          error: e, stackTrace: stackTrace);
-
-      if (e is DioException) {
-        final dioError = e;
-        AdvancedLogger.error(_tag, 'Dio error details',
-            data: {
-              'type': dioError.type.toString(),
-              'statusCode': dioError.response?.statusCode,
-              'responseMessage': dioError.response?.statusMessage,
-            });
-      }
-
-      throw OpenAIServiceException(
-        message: 'Failed to convert text to speech: ${e.toString()}',
-        code: e is DioException && e.type == DioExceptionType.connectionTimeout
-            ? 'timeout'
-            : 'api_error',
-      );
+    // First check if TTS is enabled
+    if (!_ttsEnabled) {
+      AdvancedLogger.warning(_tag, 'TTS is disabled - skipping text-to-speech conversion');
+      return null;
     }
+
+    // Create a variable to track which model we're trying
+    String currentModel = useHighQuality ? 'tts-1-hd' : 'tts-1';
+    int modelAttempt = 0;
+    final allModels = useHighQuality
+        ? [_availableTTSModels[2], _availableTTSModels[3], _availableTTSModels[0], _availableTTSModels[1]] // HD models first
+        : [_availableTTSModels[0], _availableTTSModels[1], _availableTTSModels[2], _availableTTSModels[3]]; // Standard models first
+
+    AdvancedLogger.info(_tag, 'Starting text-to-speech conversion',
+        data: {
+          'textLength': text.length,
+          'voice': voice.value,
+          'preferredModel': currentModel,
+          'speed': speed,
+        });
+
+    // Create a temporary file to save the audio
+    final directory = await getTemporaryDirectory();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final filePath = '${directory.path}/tts_${timestamp}.mp3';
+
+    // Loop through available models if needed
+    while (modelAttempt < allModels.length) {
+      try {
+        // Update current model based on attempt
+        if (modelAttempt > 0) {
+          currentModel = allModels[modelAttempt];
+          AdvancedLogger.info(_tag, 'Trying alternative TTS model',
+              data: {'model': currentModel, 'attempt': modelAttempt + 1});
+        }
+
+        // Create payload for the API request
+        final Map<String, dynamic> payload = {
+          'model': currentModel,
+          'input': text,
+          'voice': voice.value,
+        };
+
+        // Add the speed parameter if provided
+        if (speed != null) {
+          // Convert the double to a string to ensure proper typing
+          payload['speed'] = speed.toString();
+          AdvancedLogger.info(_tag, 'Setting TTS speed', data: {'speed': speed});
+        }
+
+        // Make API request to OpenAI TTS endpoint
+        final response = await _dio.post(
+          '$_baseUrl/audio/speech',
+          options: Options(
+            headers: {
+              'Authorization': 'Bearer $_apiKey',
+              'Content-Type': 'application/json',
+            },
+            responseType: ResponseType.bytes,
+            validateStatus: (status) => true, // Handle all status codes
+          ),
+          data: payload,
+        );
+
+        // Check response status
+        if (response.statusCode == 200 && response.data != null) {
+          // Save the audio data to a file
+          final file = File(filePath);
+          await file.writeAsBytes(response.data);
+
+          AdvancedLogger.info(_tag, 'Text-to-speech conversion successful',
+              data: {'filePath': filePath, 'fileSize': response.data.length, 'model': currentModel});
+
+          return file;
+        } else {
+          AdvancedLogger.error(_tag, 'Error in TTS API response',
+              data: {
+                'statusCode': response.statusCode,
+                'message': response.statusMessage,
+                'model': currentModel,
+              });
+
+          // For 403 errors, check if it's related to model access
+          if (response.statusCode == 403) {
+            // Try the next model
+            modelAttempt++;
+
+            // If we've tried all models, disable TTS
+            if (modelAttempt >= allModels.length) {
+              AdvancedLogger.error(_tag, 'All TTS models failed with 403 error - disabling TTS feature');
+              _ttsEnabled = false;
+              throw OpenAIServiceException(
+                message: 'Text-to-speech feature is not available with your API key',
+                code: 'tts_not_available',
+                statusCode: 403,
+                isRecoverable: false,
+              );
+            }
+            continue; // Try the next model
+          }
+
+          // For other errors, throw an exception
+          throw OpenAIServiceException(
+            message: 'OpenAI API error: ${response.statusMessage}',
+            code: 'api_error',
+            statusCode: response.statusCode,
+          );
+        }
+      } catch (e, stackTrace) {
+        // If it's already an OpenAIServiceException and not related to model access, don't retry
+        if (e is OpenAIServiceException && e.statusCode != 403) {
+          throw e;
+        }
+
+        // If it's a DioException, extract more details
+        if (e is DioException) {
+          AdvancedLogger.error(_tag, 'Dio error in text-to-speech conversion',
+              error: e, stackTrace: stackTrace,
+              data: {
+                'type': e.type.toString(),
+                'statusCode': e.response?.statusCode,
+                'responseMessage': e.response?.statusMessage,
+                'model': currentModel,
+              });
+
+          // Specific handling for 403 errors (usually permissions/API access)
+          if (e.response?.statusCode == 403) {
+            // Try the next model
+            modelAttempt++;
+
+            // If we've tried all models, disable TTS
+            if (modelAttempt >= allModels.length) {
+              AdvancedLogger.error(_tag, 'All TTS models failed with 403 error - disabling TTS feature');
+              _ttsEnabled = false;
+              throw OpenAIServiceException(
+                message: 'Text-to-speech feature is not available with your API key',
+                code: 'tts_not_available',
+                statusCode: 403,
+                isRecoverable: false,
+              );
+            }
+            continue; // Try the next model
+          }
+        } else {
+          AdvancedLogger.error(_tag, 'Error in text-to-speech conversion',
+              error: e, stackTrace: stackTrace);
+        }
+
+        // If we've tried all models or it's another kind of error, throw exception
+        if (modelAttempt >= allModels.length - 1 || !(e is DioException)) {
+          throw OpenAIServiceException(
+            message: 'Failed to convert text to speech: ${e.toString()}',
+            code: e is DioException && e.type == DioExceptionType.connectionTimeout
+                ? 'timeout'
+                : 'api_error',
+          );
+        }
+
+        // Try the next model
+        modelAttempt++;
+      }
+    }
+
+    // This should not be reached due to the exception in the loop, but just in case
+    AdvancedLogger.error(_tag, 'TTS conversion failed after trying all models');
+    throw OpenAIServiceException(
+      message: 'Text-to-speech conversion failed after trying all available models',
+      code: 'all_models_failed',
+      isRecoverable: false,
+    );
   }
 }

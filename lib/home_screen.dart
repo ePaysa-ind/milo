@@ -11,21 +11,69 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Bottom navigation current index
   int _currentIndex = 0;
+  bool _isSigningOut = false;
+  bool _isMounted = true;
+  final _authService = AuthService();
 
   @override
   void initState() {
     super.initState();
+    _isMounted = true;
+
+    // Register as an observer for app lifecycle events
+    WidgetsBinding.instance.addObserver(this);
+
     Logger.info('HomeScreen', 'HomeScreen initialized');
 
     // Check and log if user is authenticated
-    final currentUser = AuthService().currentUser;
+    final currentUser = _authService.currentUser;
     if (currentUser != null) {
       Logger.info('HomeScreen', 'User is authenticated: ${currentUser.uid}');
     } else {
       Logger.warning('HomeScreen', 'Warning: No authenticated user on HomeScreen');
+      // If no authenticated user, redirect to login
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_isMounted && mounted) {
+          Logger.info('HomeScreen', 'Redirecting to login due to no authenticated user');
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+      });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    Logger.info('HomeScreen', 'App lifecycle state changed to: $state');
+
+    // If the app is resumed, verify authentication is still valid
+    if (state == AppLifecycleState.resumed && _isMounted) {
+      final currentUser = _authService.currentUser;
+      Logger.info('HomeScreen', 'App resumed, checking authentication: ${currentUser != null}');
+
+      // Optional: If you want to redirect to login when user's auth expires while app is in background
+      // if (currentUser == null) {
+      //   Navigator.pushReplacementNamed(context, '/login');
+      // }
+    }
+  }
+
+  @override
+  void dispose() {
+    Logger.info('HomeScreen', 'Disposing HomeScreen');
+    _isMounted = false;
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Safe setState that checks if the widget is still mounted
+  void _safeSetState(VoidCallback fn) {
+    if (_isMounted && mounted) {
+      setState(fn);
+    } else {
+      Logger.warning('HomeScreen', 'Attempted to setState after dispose');
     }
   }
 
@@ -39,7 +87,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    setState(() {
+    _safeSetState(() {
       _currentIndex = index;
     });
 
@@ -68,21 +116,66 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Sign out method
+  // Sign out method with improved error handling
   Future<void> _signOut() async {
-    Logger.info('HomeScreen', 'Signing out user');
+    if (!_isMounted || _isSigningOut) return;
+
+    Logger.info('HomeScreen', 'Starting sign out process');
+
+    _safeSetState(() {
+      _isSigningOut = true;
+    });
+
     try {
-      await AuthService().signOut();
+      // First, record the action
+      Logger.info('HomeScreen', 'Signing out user');
+
+      // Attempt to sign out
+      await _authService.signOut();
+
       Logger.info('HomeScreen', 'User signed out successfully');
-      if (context.mounted) {
+
+      // Verify we're still mounted before navigating
+      if (_isMounted && mounted) {
+        // Use pushReplacementNamed to avoid having HomeScreen in the stack
+        Logger.info('HomeScreen', 'Navigating to login screen after signout');
         Navigator.pushReplacementNamed(context, '/login');
+      } else {
+        Logger.warning('HomeScreen', 'Widget no longer mounted after signout, skipping navigation');
       }
     } catch (e) {
+      // Log the error with enhanced details
       Logger.error('HomeScreen', 'Error signing out: $e');
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Sign out failed: $e')),
+
+      // Only show error if still mounted
+      if (_isMounted && mounted) {
+        Logger.info('HomeScreen', 'Showing error snackbar');
+
+        final messenger = ScaffoldMessenger.of(context);
+        messenger.clearSnackBars(); // Clear any existing snackbars
+
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('Sign out failed: ${e.toString().split('\n')[0]}'),
+            backgroundColor: Colors.red.shade700,
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Retry',
+              textColor: Colors.white,
+              onPressed: () {
+                Logger.info('HomeScreen', 'User retrying sign out');
+                _signOut();
+              },
+            ),
+          ),
         );
+      }
+    } finally {
+      // Reset signing out state only if we're still mounted
+      if (_isMounted) {
+        _safeSetState(() {
+          _isSigningOut = false;
+        });
       }
     }
   }
@@ -90,163 +183,181 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     Logger.debug('HomeScreen', 'Building HomeScreen UI');
-    return Scaffold(
-      backgroundColor: AppTheme.backgroundColor,
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            child: Padding(
-              padding: EdgeInsets.all(AppTheme.spacingMedium),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  // 🐶 Milo Image
-                  Container(
-                    width: 100,
-                    height: 100,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFFFFFF), // Light cream background
-                      borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
-                    ),
-                    child: Center(
-                      child: Image.asset(
-                        'assets/images/milo_happy.gif',
-                        height: 100,
+    return WillPopScope(
+      // Prevent back navigation during sign out
+      onWillPop: () async {
+        return !_isSigningOut;
+      },
+      child: Scaffold(
+        backgroundColor: AppTheme.backgroundColor,
+        body: SafeArea(
+          child: _isSigningOut
+              ? const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Signing out...'),
+              ],
+            ),
+          )
+              : Center(
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: EdgeInsets.all(AppTheme.spacingMedium),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    // 🐶 Milo Image
+                    Container(
+                      width: 100,
+                      height: 100,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFFFFF), // Light cream background
+                        borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
                       ),
-                    ),
-                  ),
-                  SizedBox(height: AppTheme.spacingMedium),
-
-                  // 📝 Headline Text
-                  Text(
-                    'Howdy from Milo!',
-                    style: TextStyle(
-                      fontSize: AppTheme.fontSizeXLarge,
-                      fontWeight: FontWeight.bold,
-                      color: AppTheme.gentleTeal,
-                    ),
-                  ),
-                  SizedBox(height: AppTheme.spacingSmall),
-
-                  // 📣 Sub Text
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20.0),
-                    child: RichText(
-                      textAlign: TextAlign.center,
-                      text: TextSpan(
-                        style: TextStyle(
-                          fontSize: AppTheme.fontSizeMedium,
-                          color: AppTheme.textColor,
+                      child: Center(
+                        child: Image.asset(
+                          'assets/images/milo_happy.gif',
+                          height: 100,
                         ),
-                        children: [
-                          TextSpan(
-                            text: 'Milo is your personal therapist, confidante & organizer! Your best friend!'
-                                '\n\n With',
-                          ),
-                          WidgetSpan(
-                            child: Icon(
-                              Icons.favorite,
-                              color: Colors.red,
-                              size: AppTheme.fontSizeMedium,
-                            ),
-                            alignment: PlaceholderAlignment.middle,
-                          ),
-                          TextSpan(
-                            text: ' for the 50+, by the 50+',
-                          ),
-                        ],
                       ),
                     ),
-                  ),
-                  SizedBox(height: AppTheme.spacingLarge),
+                    SizedBox(height: AppTheme.spacingMedium),
 
-                  // Feature cards with Material icons
-                  _buildFeatureCard(
-                    icon: Icons.mic_rounded,
-                    title: 'Reflective',
-                    description: 'Record life stories, wisdom, and feelings',
-                    iconColor: Colors.red.shade400,
-                  ),
-                  SizedBox(height: AppTheme.spacingMedium),
+                    // 📝 Headline Text
+                    Text(
+                      'Howdy from Milo!',
+                      style: TextStyle(
+                        fontSize: AppTheme.fontSizeXLarge,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.gentleTeal,
+                      ),
+                    ),
+                    SizedBox(height: AppTheme.spacingSmall),
 
-                  //_buildFeatureCard(
-                   // icon: Icons.self_improvement_rounded,
+                    // 📣 Sub Text
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 20.0),
+                      child: RichText(
+                        textAlign: TextAlign.center,
+                        text: TextSpan(
+                          style: TextStyle(
+                            fontSize: AppTheme.fontSizeMedium,
+                            color: AppTheme.textColor,
+                          ),
+                          children: [
+                            TextSpan(
+                              text: 'Milo is your personal therapist, confidante & organizer! Your best friend!'
+                                  '\n\n With',
+                            ),
+                            WidgetSpan(
+                              child: Icon(
+                                Icons.favorite,
+                                color: Colors.red,
+                                size: AppTheme.fontSizeMedium,
+                              ),
+                              alignment: PlaceholderAlignment.middle,
+                            ),
+                            TextSpan(
+                              text: ' for the 50+, by the 50+',
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: AppTheme.spacingLarge),
+
+                    // Feature cards with Material icons
+                    _buildFeatureCard(
+                      icon: Icons.mic_rounded,
+                      title: 'Reflective',
+                      description: 'Record life stories, wisdom, and feelings',
+                      iconColor: Colors.red.shade400,
+                    ),
+                    SizedBox(height: AppTheme.spacingMedium),
+
+                    //_buildFeatureCard(
+                    // icon: Icons.self_improvement_rounded,
                     //title: 'Calm',
                     //description: 'Take a deep breath and reflect.',
                     //iconColor: Colors.blue.shade400,
-                  //),
-                  //SizedBox(height: AppTheme.spacingMedium),
+                    //),
+                    //SizedBox(height: AppTheme.spacingMedium),
 
-                  _buildFeatureCard(
-                    icon: Icons.folder_special_rounded,
-                    title: 'Organized',
-                    description: 'Save precious memories in one simple folder.',
-                    iconColor: Colors.amber.shade700,
-                  ),
-                  SizedBox(height: AppTheme.spacingMedium),
+                    _buildFeatureCard(
+                      icon: Icons.folder_special_rounded,
+                      title: 'Organized',
+                      description: 'Save precious memories in one simple folder.',
+                      iconColor: Colors.amber.shade700,
+                    ),
+                    SizedBox(height: AppTheme.spacingMedium),
 
-                  _buildFeatureCard(
-                    icon: Icons.chat_bubble_outline_rounded,
-                    title: 'Conversational',
-                    description: 'Speak freely, AI responds with care.',
-                    iconColor: Colors.green.shade600,
-                  ),
-                ],
+                    _buildFeatureCard(
+                      icon: Icons.chat_bubble_outline_rounded,
+                      title: 'Conversational',
+                      description: 'Speak freely, AI responds with care.',
+                      iconColor: Colors.green.shade600,
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
         ),
-      ),
-      // Bottom navigation
-      bottomNavigationBar: Container(
-        decoration: BoxDecoration(
-          color: Colors.white,
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 8,
-              offset: const Offset(0, -2),
-            ),
-          ],
-          border: Border(
-            top: BorderSide(
-              color: Colors.grey.shade200,
-              width: 1.0,
+        // Bottom navigation
+        bottomNavigationBar: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 8,
+                offset: const Offset(0, -2),
+              ),
+            ],
+            border: Border(
+              top: BorderSide(
+                color: Colors.grey.shade200,
+                width: 1.0,
+              ),
             ),
           ),
-        ),
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                _buildNavItem(
-                  icon: Icons.home_rounded,
-                  label: 'Home',
-                  index: 0,
-                ),
-                _buildNavItem(
-                  icon: Icons.mic_rounded,
-                  label: 'Record',
-                  index: 1,
-                ),
-                _buildNavItem(
-                  icon: Icons.folder_rounded,
-                  label: 'Memories',
-                  index: 2,
-                ),
-                _buildNavItem(
-                  icon: Icons.question_answer_rounded,
-                  label: 'Ask Milo',
-                  index: 3,
-                ),
-                _buildNavItem(
-                  icon: Icons.logout,
-                  label: 'Sign Out',
-                  index: 4,
-                ),
-              ],
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  _buildNavItem(
+                    icon: Icons.home_rounded,
+                    label: 'Home',
+                    index: 0,
+                  ),
+                  _buildNavItem(
+                    icon: Icons.mic_rounded,
+                    label: 'Record',
+                    index: 1,
+                  ),
+                  _buildNavItem(
+                    icon: Icons.folder_rounded,
+                    label: 'Memories',
+                    index: 2,
+                  ),
+                  _buildNavItem(
+                    icon: Icons.question_answer_rounded,
+                    label: 'Ask Milo',
+                    index: 3,
+                  ),
+                  _buildNavItem(
+                    icon: Icons.logout,
+                    label: 'Sign Out',
+                    index: 4,
+                    isDisabled: _isSigningOut,
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -324,13 +435,15 @@ class _HomeScreenState extends State<HomeScreen> {
     required IconData icon,
     required String label,
     required int index,
+    bool isDisabled = false,
   }) {
     final bool isSelected = _currentIndex == index;
     final Color activeColor = AppTheme.gentleTeal;
     final Color inactiveColor = Colors.grey.shade500;
+    final Color disabledColor = Colors.grey.shade300;
 
     return GestureDetector(
-      onTap: () => _onTabTapped(index),
+      onTap: isDisabled ? null : () => _onTabTapped(index),
       behavior: HitTestBehavior.opaque,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -340,7 +453,9 @@ class _HomeScreenState extends State<HomeScreen> {
             Icon(
               icon,
               size: 26,
-              color: isSelected ? activeColor : inactiveColor,
+              color: isDisabled
+                  ? disabledColor
+                  : (isSelected ? activeColor : inactiveColor),
             ),
             const SizedBox(height: 2),
             Text(
@@ -348,7 +463,9 @@ class _HomeScreenState extends State<HomeScreen> {
               style: TextStyle(
                 fontSize: 12,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                color: isSelected ? activeColor : inactiveColor,
+                color: isDisabled
+                    ? disabledColor
+                    : (isSelected ? activeColor : inactiveColor),
               ),
             ),
           ],

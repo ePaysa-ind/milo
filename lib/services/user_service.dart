@@ -10,14 +10,6 @@ class UserService {
     // Check if we already have a user ID
     String? userId = prefs.getString(_userIdKey);
 
-    if (userId == null) {
-      // Create a new user ID
-      userId = 'user_${DateTime.now().millisecondsSinceEpoch}';
-
-      // Save it for future use
-      await prefs.setString(_userIdKey, userId);
-    }
-
     return userId;
   }
 }

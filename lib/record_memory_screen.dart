@@ -238,10 +238,8 @@ class _RecordMemoryScreenState extends State<RecordMemoryScreen> {
         setState(() {
           _isRecording = false;
           // Update file path with the one returned by recorder.stop()
-          if (filePath != null) {
-            _filePath = filePath;
-          }
-        });
+          _filePath = filePath;
+                });
       }
 
       if (mounted) {

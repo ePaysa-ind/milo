@@ -596,14 +596,14 @@ class _AiStoryProcessingScreenState extends State<AiStoryProcessingScreen> with 
         _handleError(ProcessingError(
             message: 'Unsupported audio format',
             details: 'The audio format is not supported for transcription. Supported formats are: ${supportedFormats.join(", ")}.',
-            stage: isProcessingError ? (e as ProcessingError).stage : ProcessingStage.transcribing,
+            stage: isProcessingError ? (e).stage : ProcessingStage.transcribing,
             isRecoverable: false
         ));
       } else {
         AdvancedLogger.error(_tag, 'Error during audio transcription',
             error: e, stackTrace: stackTrace);
 
-        _handleError(isProcessingError ? e as ProcessingError : ProcessingError(
+        _handleError(isProcessingError ? e : ProcessingError(
           message: 'Transcription error',
           details: e.toString(),
           stage: ProcessingStage.transcribing,

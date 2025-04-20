@@ -1,9 +1,15 @@
 buildscript {
-        dependencies {
-            // Add this line
-            classpath ("com.google.gms:google-services:4.3.15")
-        }
+    val kotlin_version by extra("2.1.0")
+    repositories {
+        google()
+        mavenCentral()
     }
+    dependencies {
+        // Add this line
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version")
+        classpath ("com.google.gms:google-services:4.4.2")
+    }
+}
 
 allprojects {
     repositories {
@@ -27,6 +33,6 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-plugins{ //firebase json plugin code
+plugins { //firebase json plugin code
     id("com.google.gms.google-services") version "4.4.2" apply false
 }

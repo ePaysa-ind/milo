@@ -17,6 +17,7 @@ class Message {
   final DateTime timestamp;
   File? audioFile;
   bool isPlaying = false;
+  bool ttsAttempted = false; // New flag to track if TTS was attempted for this message
 
   Message({
     required this.id,
@@ -55,10 +56,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
   bool _isProcessing = false;
   String _recordingPath = '';
   bool _isSpeechToSpeechEnabled = true; // Default true enabled
+  bool _isMounted = true; // Track if the widget is mounted
+  bool _ttsServiceAvailable = true; // Track if TTS service is available
+  int _ttsFailedAttempts = 0; // Track failed TTS attempts
+  static const int _maxTtsFailedAttempts = 3; // Max failed attempts before disabling TTS
 
   @override
   void initState() {
     super.initState();
+    _isMounted = true;
 
     Logger.info(_tag, 'Initializing conversation screen');
 
@@ -66,12 +72,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
       Logger.info(_tag, 'Starting conversation with initial prompt: ${widget.initialPrompt}');
       // Add slight delay to ensure screen is built
       Future.delayed(const Duration(milliseconds: 300), () {
-        _sendMessage(widget.initialPrompt);
+        if (_isMounted) {
+          _sendMessage(widget.initialPrompt);
+        }
       });
     }
 
     // Set up audio player state listener
     _audioPlayer.onPlayerStateChanged.listen((state) {
+      if (!_isMounted) return;
+
       Logger.debug(_tag, 'Audio player state changed: $state');
 
       // Find the currently playing message and update its state
@@ -83,16 +93,69 @@ class _ConversationScreenState extends State<ConversationScreen> {
         }
       }
     });
+
+    // Check if TTS is globally enabled in the OpenAIService
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_isMounted) return;
+
+      final openAIService = Provider.of<OpenAIService>(context, listen: false);
+      _ttsServiceAvailable = openAIService.isTTSEnabled;
+
+      if (!_ttsServiceAvailable && _isSpeechToSpeechEnabled) {
+        // If TTS is globally disabled but enabled in the UI, update the UI
+        setState(() {
+          _isSpeechToSpeechEnabled = false;
+        });
+
+        // Show message to user
+        if (_isMounted) {
+          _showSnackBar('Text-to-speech is not available with the current API configuration.', isError: true);
+        }
+      }
+    });
   }
 
   @override
   void dispose() {
+    _isMounted = false;
     _textController.dispose();
     _scrollController.dispose();
     _recorder.dispose();
     _audioPlayer.dispose();
     Logger.info(_tag, 'Conversation screen disposed');
     super.dispose();
+  }
+
+  // Safe setState that checks if the widget is still mounted
+  void _safeSetState(VoidCallback fn) {
+    if (_isMounted && mounted) {
+      setState(fn);
+    } else {
+      Logger.warning(_tag, 'Attempted to setState after dispose');
+    }
+  }
+
+  // Show a snackbar with custom styling
+  void _showSnackBar(String message, {bool isError = false, int durationSeconds = 4}) {
+    if (!_isMounted || !mounted) return;
+
+    ScaffoldMessenger.of(context).clearSnackBars(); // Clear any existing snackbars
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red.shade700 : Colors.teal,
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: durationSeconds),
+        action: isError ? SnackBarAction(
+          label: 'Dismiss',
+          textColor: Colors.white,
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+        ) : null,
+      ),
+    );
   }
 
   // Scroll to bottom of the conversation
@@ -108,6 +171,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   // Start voice recording
   Future<void> _startRecording() async {
+    if (!_isMounted) return;
+
     Logger.info(_tag, 'Starting voice recording');
 
     try {
@@ -127,42 +192,48 @@ class _ConversationScreenState extends State<ConversationScreen> {
           samplingRate: 44100,
         );
 
-        setState(() {
+        _safeSetState(() {
           _isRecording = true;
         });
 
         Logger.info(_tag, 'Voice recording started');
       } else {
         Logger.error(_tag, 'Microphone permission denied');
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Microphone permission denied')),
-        );
+        if (_isMounted) {
+          _showSnackBar('Microphone permission denied', isError: true);
+        }
       }
     } catch (e) {
       Logger.error(_tag, 'Error starting recording: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to start recording: $e')),
-      );
+      if (_isMounted) {
+        _showSnackBar('Failed to start recording: Please check microphone permissions', isError: true);
+      }
     }
   }
 
   // Stop voice recording and process audio
   Future<void> _stopRecording() async {
+    if (!_isMounted) return;
+
     Logger.info(_tag, 'Stopping voice recording');
 
     try {
       final path = await _recorder.stop();
 
-      setState(() {
+      _safeSetState(() {
         _isRecording = false;
         _isProcessing = true;
       });
 
       if (path == null) {
         Logger.error(_tag, 'Recording failed: No path returned');
-        setState(() {
+        _safeSetState(() {
           _isProcessing = false;
         });
+
+        if (_isMounted) {
+          _showSnackBar('Recording failed. Please try again', isError: true);
+        }
         return;
       }
 
@@ -172,24 +243,34 @@ class _ConversationScreenState extends State<ConversationScreen> {
       final openAIService = Provider.of<OpenAIService>(context, listen: false);
 
       // Transcribe the audio
-      final transcription = await openAIService.transcribeAudio(path);
-      Logger.info(_tag, 'Audio transcribed: $transcription');
+      try {
+        final transcription = await openAIService.transcribeAudio(path);
+        Logger.info(_tag, 'Audio transcribed: $transcription');
 
-      // Add user message with transcription
-      _addMessage(transcription, true);
+        if (!_isMounted) return;
 
-      // Now get AI response
-      await _getAIResponse(transcription);
+        // Add user message with transcription
+        _addMessage(transcription, true);
 
-      setState(() {
+        // Now get AI response
+        await _getAIResponse(transcription);
+      } catch (e) {
+        Logger.error(_tag, 'Error transcribing audio: $e');
+        if (_isMounted) {
+          _showSnackBar('Could not understand audio. Please try speaking more clearly or typing your message', isError: true);
+        }
+      }
+
+      _safeSetState(() {
         _isProcessing = false;
       });
     } catch (e) {
       Logger.error(_tag, 'Error processing recording: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to process recording: $e')),
-      );
-      setState(() {
+      if (_isMounted) {
+        _showSnackBar('Failed to process recording: $e', isError: true);
+      }
+
+      _safeSetState(() {
         _isProcessing = false;
       });
     }
@@ -197,11 +278,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   // Send a text message
   Future<void> _sendMessage(String text) async {
+    if (!_isMounted) return;
     if (text.trim().isEmpty) return;
 
     Logger.info(_tag, 'Sending message: $text');
 
-    setState(() {
+    _safeSetState(() {
       _isSending = true;
     });
 
@@ -214,13 +296,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // Get AI response
     await _getAIResponse(text);
 
-    setState(() {
+    _safeSetState(() {
       _isSending = false;
     });
   }
 
   // Get response from OpenAI
   Future<void> _getAIResponse(String userMessage) async {
+    if (!_isMounted) return;
+
     Logger.info(_tag, 'Getting AI response for: $userMessage');
 
     try {
@@ -238,43 +322,135 @@ class _ConversationScreenState extends State<ConversationScreen> {
         conversation: conversationHistory,
       );
 
+      if (!_isMounted) return;
+
       Logger.info(_tag, 'AI response received');
 
       // Add AI message to the conversation
       final message = _addMessage(response, false);
 
-      // Convert to speech if enabled
-      if (_isSpeechToSpeechEnabled) {
-        Logger.info(_tag, 'Converting AI response to speech');
-
-        try {
-          final speechFile = await openAIService.textToSpeech(response);
-          message.audioFile = speechFile;
-          Logger.info(_tag, 'Speech generated successfully');
-
-          // Auto-play the response
-          _playMessageAudio(message);
-        } catch (e) {
-          Logger.error(_tag, 'Error generating speech: $e');
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Failed to generate speech')),
-          );
-        }
+      // Convert to speech if enabled and service is available
+      if (_isSpeechToSpeechEnabled && _ttsServiceAvailable) {
+        await _generateAndPlaySpeech(message, openAIService);
       }
     } catch (e) {
+      if (!_isMounted) return;
+
       Logger.error(_tag, 'Error getting AI response: $e');
 
       // Add error message
       _addMessage('Sorry, I had trouble connecting. Please try again.', false);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
+      if (_isMounted) {
+        _showSnackBar('Error communicating with AI service. Please check your internet connection.', isError: true);
+      }
+    }
+  }
+
+  // Generate speech for a message and play it
+  Future<void> _generateAndPlaySpeech(Message message, OpenAIService openAIService) async {
+    if (!_isMounted) return;
+
+    Logger.info(_tag, 'Converting AI response to speech');
+
+    // Mark that TTS was attempted for this message
+    message.ttsAttempted = true;
+
+    try {
+      // First check if TTS is still enabled in the service
+      if (!openAIService.isTTSEnabled) {
+        if (_isMounted && _isSpeechToSpeechEnabled) {
+          _safeSetState(() {
+            _ttsServiceAvailable = false;
+            _isSpeechToSpeechEnabled = false;
+          });
+          _showSnackBar('Text-to-speech service is not available', isError: true);
+        }
+        return;
+      }
+
+      // Try to generate speech with standard quality first
+      final speechFile = await openAIService.textToSpeech(
+        message.text,
+        useHighQuality: false, // Use standard quality for reliability
       );
+
+      if (!_isMounted) return;
+
+      if (speechFile != null) {
+        // Reset failed attempts counter on success
+        _ttsFailedAttempts = 0;
+
+        message.audioFile = speechFile;
+        Logger.info(_tag, 'Speech generated successfully');
+
+        // Auto-play the response if still mounted
+        if (_isMounted) {
+          _playMessageAudio(message);
+        }
+      } else {
+        // If null was returned but no exception occurred
+        Logger.warning(_tag, 'Speech generation returned null without error');
+        _handleTtsFailure('Failed to generate speech. Using text-only mode.');
+      }
+    } on OpenAIServiceException catch (e) {
+      if (!_isMounted) return;
+
+      Logger.error(_tag, 'OpenAI service error generating speech: ${e.code} - ${e.message}');
+
+      // Check for non-recoverable errors related to TTS availability
+      if (!e.isRecoverable || e.code == 'tts_not_available') {
+        Logger.error(_tag, 'TTS is not available, disabling speech-to-speech feature');
+
+        // Disable TTS in the UI
+        _safeSetState(() {
+          _ttsServiceAvailable = false;
+          _isSpeechToSpeechEnabled = false;
+        });
+
+        _showSnackBar('Text-to-speech service is not available with your API configuration', isError: true);
+      } else {
+        // For recoverable errors, increment failed attempts
+        _handleTtsFailure('Failed to generate speech. We\'ll try again next time.');
+      }
+    } catch (e) {
+      if (!_isMounted) return;
+
+      Logger.error(_tag, 'Error generating speech: $e');
+      _handleTtsFailure('Failed to generate speech. Please check your internet connection.');
+    }
+  }
+
+  // Handle TTS failure with proper UI updates
+  void _handleTtsFailure(String message) {
+    if (!_isMounted) return;
+
+    _ttsFailedAttempts++;
+    Logger.warning(_tag, 'TTS failed attempt: $_ttsFailedAttempts of $_maxTtsFailedAttempts');
+
+    // If we've reached the max failed attempts, disable TTS to avoid further failures
+    if (_ttsFailedAttempts >= _maxTtsFailedAttempts) {
+      _safeSetState(() {
+        _isSpeechToSpeechEnabled = false;
+      });
+      _showSnackBar('Voice responses have been temporarily disabled due to connection issues', isError: true);
+    } else {
+      _showSnackBar(message, isError: true);
     }
   }
 
   // Add a message to the conversation
   Message _addMessage(String text, bool isUser) {
+    if (!_isMounted) {
+      // Return a dummy message if not mounted (should not happen)
+      return Message(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        isUser: isUser,
+        text: text,
+        timestamp: DateTime.now(),
+      );
+    }
+
     final message = Message(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       isUser: isUser,
@@ -282,13 +458,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
       timestamp: DateTime.now(),
     );
 
-    setState(() {
+    _safeSetState(() {
       _messages.add(message);
     });
 
     // Scroll to the bottom after adding message
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _scrollToBottom();
+      if (_isMounted) {
+        _scrollToBottom();
+      }
     });
 
     return message;
@@ -296,6 +474,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   // Play audio for a message
   Future<void> _playMessageAudio(Message message) async {
+    if (!_isMounted) return;
     if (message.audioFile == null) return;
 
     Logger.info(_tag, 'Playing audio for message: ${message.id}');
@@ -303,86 +482,115 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // Stop any currently playing audio
     for (final msg in _messages) {
       if (msg.isPlaying) {
-        setState(() {
+        _safeSetState(() {
           msg.isPlaying = false;
         });
       }
     }
 
     // Play this message's audio
-    setState(() {
+    _safeSetState(() {
       message.isPlaying = true;
     });
 
     try {
+      await _audioPlayer.stop(); // Ensure previous audio is stopped
       await _audioPlayer.play(DeviceFileSource(message.audioFile!.path));
 
+      // Listen for completion to update state
       _audioPlayer.onPlayerComplete.listen((_) {
-        setState(() {
-          message.isPlaying = false;
-        });
+        if (_isMounted) {
+          _safeSetState(() {
+            message.isPlaying = false;
+          });
+        }
       });
     } catch (e) {
       Logger.error(_tag, 'Error playing audio: $e');
-      setState(() {
+      _safeSetState(() {
         message.isPlaying = false;
       });
+
+      if (_isMounted) {
+        _showSnackBar('Error playing audio: Please try again', isError: true);
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Ask Milo'),
-        actions: [
-          // Toggle speech-to-speech button
-          IconButton(
-            icon: Icon(_isSpeechToSpeechEnabled
-                ? Icons.volume_up
-                : Icons.volume_off),
-            onPressed: () {
-              setState(() {
-                _isSpeechToSpeechEnabled = !_isSpeechToSpeechEnabled;
-              });
-              Logger.info(_tag, 'Speech-to-speech ${_isSpeechToSpeechEnabled ? 'enabled' : 'disabled'}');
-            },
-            tooltip: _isSpeechToSpeechEnabled
-                ? 'Disable voice responses'
-                : 'Enable voice responses',
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // Messages list
-          Expanded(
-            child: _messages.isEmpty
-                ? _buildWelcomeView()
-                : _buildMessagesList(),
-          ),
+    return WillPopScope(
+      onWillPop: () async {
+        // Handle back button press
+        if (_isRecording) {
+          // If recording, stop it first
+          await _stopRecording();
+          return false; // Don't navigate back yet
+        }
+        return true; // Allow back navigation
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Ask Milo'),
+          actions: [
+            // Toggle speech-to-speech button (disabled if service not available)
+            IconButton(
+              icon: Icon(_isSpeechToSpeechEnabled
+                  ? Icons.volume_up
+                  : Icons.volume_off),
+              onPressed: _ttsServiceAvailable ? () {
+                _safeSetState(() {
+                  _isSpeechToSpeechEnabled = !_isSpeechToSpeechEnabled;
+                });
+                Logger.info(_tag, 'Speech-to-speech ${_isSpeechToSpeechEnabled ? 'enabled' : 'disabled'}');
 
-          // Status indicator
-          if (_isProcessing)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8.0),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 12),
-                  Text('Processing audio...'),
-                ],
-              ),
+                _showSnackBar(
+                  _isSpeechToSpeechEnabled
+                      ? 'Voice responses enabled'
+                      : 'Voice responses disabled',
+                  isError: false,
+                  durationSeconds: 2,
+                );
+              } : null, // Disabled if TTS service is not available
+              tooltip: _ttsServiceAvailable
+                  ? (_isSpeechToSpeechEnabled
+                  ? 'Disable voice responses'
+                  : 'Enable voice responses')
+                  : 'Voice responses unavailable',
+            ),
+          ],
+        ),
+        body: Column(
+          children: [
+            // Messages list
+            Expanded(
+              child: _messages.isEmpty
+                  ? _buildWelcomeView()
+                  : _buildMessagesList(),
             ),
 
-          // Input area
-          _buildInputArea(),
-        ],
+            // Status indicator
+            if (_isProcessing)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 12),
+                    Text('Processing audio...'),
+                  ],
+                ),
+              ),
+
+            // Input area
+            _buildInputArea(),
+          ],
+        ),
       ),
     );
   }
@@ -498,6 +706,30 @@ class _ConversationScreenState extends State<ConversationScreen> {
                   ),
                 ),
               ),
+
+            // Show "Voice unavailable" indicator when TTS was attempted but failed
+            if (!isUser && message.ttsAttempted && message.audioFile == null && _isSpeechToSpeechEnabled)
+              Padding(
+                padding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.volume_off,
+                      color: Colors.grey.shade500,
+                      size: 16,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Voice unavailable',
+                      style: TextStyle(
+                        color: Colors.grey.shade500,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ),
       ),
@@ -524,7 +756,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
           IconButton(
             icon: Icon(_isRecording ? Icons.stop : Icons.mic),
             color: _isRecording ? Colors.red : null,
-            onPressed: _isProcessing
+            onPressed: _isProcessing || _isSending
                 ? null
                 : (_isRecording ? _stopRecording : _startRecording),
           ),
@@ -539,18 +771,17 @@ class _ConversationScreenState extends State<ConversationScreen> {
                 contentPadding: EdgeInsets.symmetric(horizontal: 8.0),
               ),
               onChanged: (text){
-                // Add logging here where it's safe to do so
-                print('Text: "${_textController.text}", isEmpty: ${_textController.text.trim().isEmpty}');
-                print('States: isRecording: $_isRecording, isProcessing: $_isProcessing, isSending: $_isSending');
-
+                // Force UI update to enable/disable send button
                 setState(() {});
               },
-              // commented out enabled: !_isRecording && !_isProcessing,
+              enabled: !_isRecording && !_isProcessing && !_isSending,
               minLines: 1,
               maxLines: 4,
               textCapitalization: TextCapitalization.sentences,
               onSubmitted: (_) {
-                _sendMessage(_textController.text);
+                if (!_isRecording && !_isProcessing && !_isSending && _textController.text.trim().isNotEmpty) {
+                  _sendMessage(_textController.text);
+                }
               },
             ),
           ),
@@ -560,8 +791,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
             icon: const Icon(Icons.send),
             color: Colors.teal,
             onPressed: (_isRecording || _isProcessing || _isSending || _textController.text.trim().isEmpty)
-                ? null //disables the button when text is empty
-                : () => _sendMessage(_textController.text), //enables button when text is input
+                ? null // Disable the button when text is empty or still busy
+                : () => _sendMessage(_textController.text),
           ),
         ],
       ),

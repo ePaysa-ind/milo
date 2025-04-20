@@ -14,6 +14,9 @@ import 'dart:io';
 // Import Firebase options
 import 'firebase_options.dart';
 
+// Import EnvService for Firebase API keys
+import 'services/env_service.dart';
+
 // Theme
 import 'theme/app_theme.dart';
 
@@ -38,6 +41,9 @@ import '../utils/advanced_logger.dart';
 import 'utils/config.dart';
 import 'utils/logger.dart';
 
+// Flag to track Firebase initialization status globally
+bool _isFirebaseInitialized = false;
+
 void main() async {
   // This needs to be called only once
   WidgetsFlutterBinding.ensureInitialized();
@@ -46,24 +52,59 @@ void main() async {
   // Initialize security provider early
   await SecurityProviderInitializer.initialize();
 
-  // Initialize Firebase first - ONLY ONCE
-  bool firebaseInitialized = false;
+  // FIRST: Load environment variables BEFORE Firebase initialization
+  try {
+    Logger.info('App', 'Loading environment variables...');
+    await dotenv.load();
+    Logger.info('App', 'Environment variables loaded successfully');
+
+    // Add debug logging to verify API keys are loaded
+    final androidKeyStatus = EnvService.firebaseAndroidApiKey.isNotEmpty
+        ? 'available' : 'missing';
+    final iosKeyStatus = EnvService.firebaseIosApiKey.isNotEmpty
+        ? 'available' : 'missing';
+
+    Logger.info('App', 'Android Firebase API Key: $androidKeyStatus');
+    Logger.info('App', 'iOS Firebase API Key: $iosKeyStatus');
+
+    // Show warning if keys are missing
+    if (EnvService.firebaseAndroidApiKey.isEmpty || EnvService.firebaseIosApiKey.isEmpty) {
+      Logger.warning('App', 'One or more Firebase API keys are missing in .env file');
+    }
+  } catch (e) {
+    Logger.error('App', 'Failed to load environment variables: $e');
+    Logger.error('App', 'This may cause Firebase initialization to fail');
+  }
+
+  // FIREBASE INITIALIZATION - SIMPLIFIED APPROACH
   try {
     Logger.info('App', 'Initializing Firebase...');
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-    firebaseInitialized = true;
-    AdvancedLogger.info('App', 'Firebase core initialized successfully',
-        data: {'projectId': DefaultFirebaseOptions.currentPlatform.projectId});
 
-    // Log Firebase configuration details for debugging
-    Logger.info('App', 'Firebase project ID: ${DefaultFirebaseOptions.currentPlatform.projectId}');
-    Logger.info('App', 'Firebase app ID: ${DefaultFirebaseOptions.currentPlatform.appId}');
-    Logger.info('App', 'Firebase messaging sender ID: ${DefaultFirebaseOptions.currentPlatform.messagingSenderId}');
+    if (Firebase.apps.isNotEmpty) {
+      // Already initialized - just use existing app
+      Logger.info('App', 'Firebase already initialized, using existing app');
+      _isFirebaseInitialized = true;
+    } else {
+      // Initialize Firebase
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+      Logger.info('App', 'Firebase initialization successful');
+      _isFirebaseInitialized = true;
+    }
+
+    // Log Firebase info if initialized
+    if (_isFirebaseInitialized) {
+      Logger.info('App', 'Firebase project ID: ${DefaultFirebaseOptions.currentPlatform.projectId}');
+      Logger.info('App', 'Firebase app ID: ${DefaultFirebaseOptions.currentPlatform.appId}');
+    }
   } catch (e) {
-    Logger.error('App', 'Failed to initialize Firebase: $e');
-    Logger.error('App', 'Firebase error details: ${e.toString()}');
+    if (e.toString().contains('duplicate-app')) {
+      Logger.warning('App', 'Duplicate Firebase initialization detected, continuing with existing app');
+      _isFirebaseInitialized = true;
+    } else {
+      Logger.error('App', 'Firebase initialization failed: $e');
+    }
   }
 
   // Request app permissions
@@ -92,14 +133,6 @@ void main() async {
     // Non-critical, app can continue
   }
 
-  // Load environment variables
-  try {
-    await dotenv.load();
-    Logger.info('App', 'Environment variables loaded');
-  } catch (e) {
-    Logger.error('App', 'Failed to load environment variables: $e');
-  }
-
   // Initialize app configuration
   try {
     await AppConfig().initialize();
@@ -124,7 +157,7 @@ void main() async {
   }
 
   // After Firebase.initializeApp()
-  if (firebaseInitialized) {
+  if (_isFirebaseInitialized) {
     Logger.info('App', 'Starting auth state monitoring...');
     try {
       AuthService().monitorAuthState();
@@ -183,11 +216,16 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
     // Register for app lifecycle events to improve error handling
     WidgetsBinding.instance.addObserver(this);
 
-    // Check Google Play Services availability
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkGooglePlayServices();
-      _runFirebaseTests();
-    });
+    // Check Google Play Services availability - but only if Firebase is initialized
+    if (_isFirebaseInitialized) {
+      // Add delay to avoid potential initialization conflicts
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Future.delayed(const Duration(seconds: 2), () {
+          _checkGooglePlayServices();
+          _runFirebaseTests();
+        });
+      });
+    }
   }
 
   @override
@@ -253,7 +291,7 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
   }
 
   void _checkGooglePlayServices() async {
-    if (kDebugMode) {
+    if (kDebugMode && _isFirebaseInitialized) {
       try {
         // Simple test to check if we can access Firebase Analytics
         // This will indirectly test Google Play Services
@@ -297,10 +335,7 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
   }
 
   void _runFirebaseTests() async {
-    if (kDebugMode) {
-      // Wait a bit before running tests
-      await Future.delayed(const Duration(seconds: 2));
-
+    if (kDebugMode && _isFirebaseInitialized) {
       Logger.info('App', 'Testing Firebase Analytics...');
       try {
         await FirebaseAnalytics.instance.logEvent(

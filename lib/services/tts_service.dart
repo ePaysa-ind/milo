@@ -72,19 +72,24 @@ class TTSService {
   final OpenAIService _openAIService;
 
   // Internal state
-  final FlutterTts _flutterTts = FlutterTts(); // Fixed: proper initialization
-  final AudioPlayer _audioPlayer = AudioPlayer(); // Fixed: proper initialization
+  final FlutterTts _flutterTts = FlutterTts();
+  final AudioPlayer _audioPlayer = AudioPlayer();
   TTSStatus _status = TTSStatus.idle;
   File? _lastAudioFile;
   String? _lastText;
   bool _preferDeviceTTS = false;
   bool _isFlutterTTSInitialized = false;
 
+  // Track failed attempts
+  int _failedCloudTTSAttempts = 0;
+  static const int _maxFailedAttempts = 3;
+
   // Public properties
   TTSStatus get status => _status;
   bool get isPlaying => _status == TTSStatus.playing;
   bool get isLoading => _status == TTSStatus.loading;
   String? get lastText => _lastText;
+  bool get cloudTTSAvailable => _openAIService.isTTSEnabled;
 
   // Event listeners
   final ValueNotifier<TTSStatus> statusNotifier = ValueNotifier(TTSStatus.idle);
@@ -196,10 +201,19 @@ class TTSService {
     _setStatus(TTSStatus.loading);
 
     try {
+      // Check if OpenAI TTS is globally disabled
+      final isOpenAITTSAvailable = _openAIService.isTTSEnabled;
+
       // Determine whether to use device TTS or OpenAI TTS
-      if (forceDeviceTTS || _preferDeviceTTS) {
-        AdvancedLogger.info(_tag, 'Using device TTS based on preference',
-            data: {'preferDevice': _preferDeviceTTS, 'forceDevice': forceDeviceTTS});
+      if (forceDeviceTTS || _preferDeviceTTS || !isOpenAITTSAvailable || _failedCloudTTSAttempts >= _maxFailedAttempts) {
+        AdvancedLogger.info(_tag, 'Using device TTS',
+            data: {
+              'reason': forceDeviceTTS ? 'forced' :
+              _preferDeviceTTS ? 'preferred' :
+              !isOpenAITTSAvailable ? 'cloud unavailable' :
+              'too many failures',
+              'failedAttempts': _failedCloudTTSAttempts,
+            });
         await _speakWithDeviceTTS(text, speed: speed);
       } else {
         // Try OpenAI TTS first, fall back to device TTS if needed
@@ -207,7 +221,24 @@ class TTSService {
 
         if (!success) {
           AdvancedLogger.info(_tag, 'Falling back to device TTS after OpenAI TTS failure');
+
+          // Increment failed attempts counter
+          _failedCloudTTSAttempts++;
+          AdvancedLogger.warning(_tag, 'Cloud TTS failure count increased',
+              data: {'count': _failedCloudTTSAttempts, 'max': _maxFailedAttempts});
+
+          // If we've reached max failed attempts, log a more severe warning
+          if (_failedCloudTTSAttempts >= _maxFailedAttempts) {
+            AdvancedLogger.warning(_tag, 'Cloud TTS temporarily disabled due to repeated failures');
+          }
+
           await _speakWithDeviceTTS(text, speed: speed);
+        } else {
+          // Reset failed attempts counter on success
+          if (_failedCloudTTSAttempts > 0) {
+            _failedCloudTTSAttempts = 0;
+            AdvancedLogger.info(_tag, 'Cloud TTS failure count reset after successful request');
+          }
         }
       }
     } catch (e, stackTrace) {
@@ -264,12 +295,12 @@ class TTSService {
         }
       }
 
-      // Generate new TTS audio
+      // Generate new TTS audio - UPDATED PARAMETER NAME
       final audioFile = await _openAIService.textToSpeech(
         text,
         voice: voice,
         speed: speed,
-        useAdvancedModel: true,  // Try advanced model first
+        useHighQuality: true,  // Updated parameter name
       );
 
       if (audioFile == null) {
@@ -293,6 +324,19 @@ class TTSService {
         _setStatus(TTSStatus.error);
         return false;
       }
+    } on OpenAIServiceException catch (e, stackTrace) {
+      AdvancedLogger.error(_tag, 'OpenAI Service Exception',
+          error: e, stackTrace: stackTrace,
+          data: {'code': e.code, 'recoverable': e.isRecoverable});
+
+      // Special handling for TTS not available exception
+      if (e.code == 'tts_not_available') {
+        AdvancedLogger.error(_tag, 'TTS feature not available with current API key configuration');
+        // Permanently set preference to device TTS
+        _preferDeviceTTS = true;
+      }
+
+      return false;
     } catch (e, stackTrace) {
       AdvancedLogger.error(_tag, 'Error with OpenAI TTS',
           error: e, stackTrace: stackTrace);
@@ -415,6 +459,12 @@ class TTSService {
     AdvancedLogger.info(_tag, 'TTS preference updated', data: {'preferDeviceTTS': prefer});
   }
 
+  // Reset failed attempts counter - useful if you want to retry cloud TTS after errors
+  void resetFailedAttemptsCounter() {
+    _failedCloudTTSAttempts = 0;
+    AdvancedLogger.info(_tag, 'Cloud TTS failed attempts counter reset manually');
+  }
+
   // Check if device TTS is available
   Future<bool> isDeviceTTSAvailable() async {
     try {
@@ -452,6 +502,8 @@ class TTSService {
   String createUserFriendlyErrorMessage(dynamic error) {
     if (error is OpenAIServiceException) {
       switch (error.code) {
+        case 'tts_not_available':
+          return 'The cloud voice service is not available with your current API settings. Using your device\'s built-in voice instead.';
         case 'model_not_found':
           return 'The text-to-speech service is temporarily unavailable. Using your device\'s built-in voice instead.';
         case 'network_error':
@@ -462,6 +514,8 @@ class TTSService {
           return 'The text-to-speech service is currently busy. Please try again in a few moments.';
         case 'invalid_request':
           return 'There was an issue with the text-to-speech request. Using your device\'s built-in voice instead.';
+        case 'all_models_failed':
+          return 'All available voice models failed. Using your device\'s built-in voice instead.';
         default:
           return 'There was a problem with the text-to-speech service. Using your device\'s voice instead.';
       }
