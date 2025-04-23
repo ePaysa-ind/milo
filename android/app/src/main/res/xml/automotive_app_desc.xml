@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  This file declares the app as having important features that should
+  be exempt from aggressive battery optimizations. This is especially
+  important for therapeutic nudges aimed at elderly users.
+-->
+<automotiveApp>
+    <!-- Declare app notifications as important for user health and well-being -->
+    <uses name="notification" />
+
+    <!-- Declare app as having important healthcare-related features -->
+    <uses name="templateCustomization" />
+</automotiveApp>

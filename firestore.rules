@@ -1,0 +1,227 @@
+// Firestore rules for Milo therapeutic nudge system
+// Version: 2.1.0
+// Last updated: 2025-04-22
+// Testing: Use firebase emulator with firebase serve --only firestore
+// For rate limiting tests: Use the security rules playground in Firebase Console
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions for authentication checks
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUserDocOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isResearcher() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/researchers/$(request.auth.uid));
+    }
+
+    function isServiceAccount() {
+      return isAuthenticated()
+        && request.auth.token.firebase.sign_in_provider == 'custom'
+        && request.auth.token.service_account == true;
+    }
+
+    // Add back data validation functions
+    // Function 1: Helper for checking required fields
+    function hasRequiredFields(requiredFields) {
+      return request.resource.data.keys().hasAll(requiredFields);
+    }
+
+    // Function 2: Time window validation
+    function isValidTimeWindow(timeWindow) {
+      return timeWindow in ['morning', 'midday', 'evening'];
+    }
+
+    // Function 3: Category validation
+    function isValidCategory(category) {
+      return category in ['gratitude', 'mindfulness', 'selfReflection',
+                         'reassurance', 'cognitive', 'health',
+                         'social', 'memory'];
+    }
+
+    // Function 4: Rate limiting with simplified structure
+    function notRateLimited(userId, collectionPath, limitPerHour) {
+      return !exists(/databases/$(database)/documents/rateLimits/$(userId)) ||
+             get(/databases/$(database)/documents/rateLimits/$(userId)).data.counters[collectionPath] <= limitPerHour;
+    }
+
+    // Function 5: Version control for templates
+    function versionNotDowngraded(oldData, newData) {
+      return !('version' in oldData) || newData.version >= oldData.version;
+    }
+
+    // Function 6: Type validation for fields
+    function isValidType(value, type) {
+      return (type == 'string' && value is string) ||
+             (type == 'number' && value is number) ||
+             (type == 'boolean' && value is bool) ||
+             (type == 'map' && value is map) ||
+             (type == 'array' && value is list) ||
+             (type == 'timestamp' && value is timestamp) ||
+             (type == 'null' && value == null);
+    }
+
+    // Base rules - deny by default
+    match /{document=**} {
+      allow read, write: if false; // Default deny: "Permission denied"
+    }
+
+    // Rules for nudgeTemplates collection - ADMIN ONLY direct access
+    match /nudgeTemplates/{templateId} {
+      // Only admins, researchers, and service accounts can read templates directly
+      allow read: if isAdmin() || isServiceAccount() || isResearcher();
+
+      // Only admins can create templates with validation
+      allow create: if isAdmin()
+                     && hasRequiredFields(['id', 'category', 'timeWindow', 'templateContent',
+                                          'audioPrompt', 'version', 'active', 'tags'])
+                     && isValidCategory(request.resource.data.category)
+                     && isValidTimeWindow(request.resource.data.timeWindow)
+                     && notRateLimited(request.auth.uid, "nudgeTemplates", 100);
+
+      // Only admins can update templates with version control
+      allow update: if isAdmin()
+                     && versionNotDowngraded(resource.data, request.resource.data)
+                     && notRateLimited(request.auth.uid, "nudgeTemplates", 100);
+
+      // Only admins can delete templates
+      allow delete: if isAdmin()
+                     && notRateLimited(request.auth.uid, "nudgeTemplates", 50);
+    }
+
+    // Special rule for service account to deliver templates to users
+    match /serviceDelivery/nudgeTemplates {
+      // Service accounts can read the optimized template cache for delivery
+      allow read: if isServiceAccount();
+
+      // Only service accounts can update the delivery cache
+      allow write: if isServiceAccount();
+    }
+
+    // User-specific nudge collections
+    match /users/{userId}/nudgeDeliveries/{deliveryId} {
+      // Users can read their own nudge deliveries, admins and researchers can read all
+      allow read: if isUserDocOwner(userId) || isAdmin() || isResearcher();
+
+      // Users can create their own delivery logs with restrictions
+      allow create: if isUserDocOwner(userId)
+                     && hasRequiredFields(['nudgeTemplateId', 'userId', 'deliveredAt',
+                                          'timeWindow', 'personalizedFactors'])
+                     && isValidTimeWindow(request.resource.data.timeWindow)
+                     && notRateLimited(request.auth.uid, "nudgeDeliveries", 50);
+
+      // Users can update limited fields in their own delivery logs
+      allow update: if isUserDocOwner(userId)
+                     && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['wasHelpful', 'wasSavedAsMemory', 'userResponse',
+                                 'audioPlaybackStats', 'relatedMemoryId',
+                                 'interactionEvents', 'metadata', 'feedback',
+                                 'savedAsMemory'])
+                     && notRateLimited(request.auth.uid, "nudgeDeliveriesUpdates", 100);
+
+      // Only admins can delete delivery logs (for audit purposes)
+      allow delete: if isAdmin(); // Clear error: "Only admins can delete delivery logs"
+    }
+
+    // User nudge settings
+    match /users/{userId}/nudgeSettings/{doc} {
+      // Users can read their own settings, admins and researchers can read all
+      allow read: if isUserDocOwner(userId) || isAdmin() || isResearcher();
+
+      // Users can create and update their own settings with validation
+      allow create, update: if (isUserDocOwner(userId) || isAdmin())
+                              && doc == 'settings'
+                              && hasRequiredFields(['nudgesEnabled', 'enabledTimeWindows',
+                                                   'enabledCategories', 'allowDeviceUnlockTrigger',
+                                                   'allowTimeBasedTrigger', 'maxNudgesPerDay',
+                                                   'preferredVoice', 'privacySettings',
+                                                   'personalizationPreferences'])
+                              && notRateLimited(request.auth.uid, "settingsChanges", 20);
+
+      // Users cannot delete settings
+      allow delete: if false; // "Deleting settings is not allowed, use update to disable instead"
+    }
+
+    // User nudge stats
+    match /users/{userId}/nudgeStats/{doc} {
+      allow read: if isUserDocOwner(userId) || isAdmin() || isResearcher();
+      allow write: if isAdmin() || isServiceAccount(); // Managed by Cloud Functions
+    }
+
+    // User memories - integration with memory feature
+    match /users/{userId}/memories/{memoryId} {
+      allow read: if isUserDocOwner(userId) || isAdmin();
+
+      // Allow updating memory to link it with a nudge
+      allow update: if isUserDocOwner(userId)
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                      .hasOnly(['relatedNudgeIds', 'tags', 'metadata']);
+    }
+
+    // User personalization data
+    match /users/{userId}/personalizationData/{doc} {
+      allow read: if isUserDocOwner(userId) || isAdmin();
+      allow write: if isUserDocOwner(userId) || isAdmin();
+    }
+
+    // Rules for admin access to user data (for support and analytics)
+    match /users/{userId}/{document=**} {
+      // Admins can read all user data
+      allow read: if isAdmin() || isResearcher();
+
+      // Admins cannot modify user data directly
+      allow write: if false; // "Admin direct modification of user data is not allowed"
+    }
+
+    // Admin users collection
+    match /admins/{userId} {
+      // Admin users can read the admin list
+      allow read: if isAdmin();
+
+      // Only existing admins can create/update/delete admin status
+      allow write: if isAdmin();
+    }
+
+    // Researcher users collection
+    match /researchers/{userId} {
+      // Researchers and admins can read the researcher list
+      allow read: if isAdmin() || isResearcher();
+
+      // Only admins can create/update/delete researcher status
+      allow write: if isAdmin();
+    }
+
+    // Emergency backup admin rule - if all admins are removed
+    match /admins/emergency_restore {
+      // Special document that can be created once if no admins exist
+      allow create: if isAuthenticated()
+                     && !exists(/databases/$(database)/documents/admins/emergency_restore)
+                     && getAfter(/databases/$(database)/documents/admins).size() == 0;
+    }
+
+    // Rate limiting collection
+    match /rateLimits/{userId} {
+      // Users can read their own rate limits
+      allow read: if request.auth.uid == userId;
+
+      // Only system functions can update rate limits
+      allow write: if isServiceAccount();
+    }
+
+    // Audit logs for security
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated(); // System can create audit logs
+      allow update, delete: if false; // Immutable once created
+    }
+  }
+}
