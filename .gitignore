@@ -75,3 +75,6 @@ lib/config/keys.dart
 
 # Coverage
 coverage/
+
+#firestore collections rules
+scripts/serviceAccountKey.json
