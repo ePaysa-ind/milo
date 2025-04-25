@@ -1,4 +1,9 @@
+// Copyright © 2025 Milo Team. All rights reserved.
 // lib/services/auth_service.dart
+// 1.1.3, Created: April 24, 2025
+// fixed <type> due to FB limitations, stacktrace, cookies
+// Updated sign-in methods to use set(merge: true) for robustness
+
 import 'dart:async';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
@@ -7,7 +12,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:milo/utils/advanced_logger.dart';
+import 'package:milo/utils/logger.dart';
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 
 class AuthException implements Exception {
@@ -60,6 +65,10 @@ class AuthService {
   // Authentication session timeout (8 hours)
   static const int _sessionTimeoutHours = 8;
 
+  // Freemium session timeout (5 minutes)
+  static const int _freemiumSessionTimeoutMinutes = 5;
+  static const int _freemiumMaxLogins = 4;
+
   // Failed login attempts tracking
   static const int _maxFailedAttempts = 5;
   static const String _failedAttemptsKey = 'failed_login_attempts';
@@ -74,6 +83,9 @@ class AuthService {
 
   // Session id for tracking
   String? _sessionId;
+
+  // Session timer reference
+  Timer? _sessionTimer;
 
   // MFA verification flow flag
   bool _isMfaVerificationFlow = false;
@@ -90,7 +102,10 @@ class AuthService {
   void monitorAuthState() {
     _auth.authStateChanges().listen((User? user) {
       if (user == null) {
-        AdvancedLogger.info(_tag, 'User is currently signed out');
+        Logger.info(_tag, 'User is currently signed out');
+        _sessionTimer?.cancel(); // Ensure timer stops on external sign out
+        // Clear local session data if needed on external sign out
+        _clearSessionData();
       } else {
         // Mask the email for security in logs
         final emailParts = user.email?.split('@') ?? ['unknown'];
@@ -98,10 +113,10 @@ class AuthService {
             ? '${emailParts[0].substring(0, min(3, emailParts[0].length))}***@${emailParts[1]}'
             : 'unknown@email.com';
 
-        AdvancedLogger.info(_tag, 'User is signed in',
-            data: {'uid': user.uid, 'email': maskedEmail});
+        Logger.info(_tag, 'User is signed in with UID: ${user.uid}, email: $maskedEmail');
 
-        // Create new session when user signs in
+        // Create new session when user signs in (if not already created by login flow)
+        // Check if session exists before creating a new one might be better
         _createAuthSession(user.uid);
       }
     });
@@ -109,14 +124,17 @@ class AuthService {
     // Also listen for user token changes
     _auth.idTokenChanges().listen((User? user) {
       if (user != null) {
-        AdvancedLogger.info(_tag, 'User token refreshed',
-            data: {'uid': user.uid});
+        Logger.info(_tag, 'User token refreshed with UID: ${user.uid}');
+        // Optionally refresh stored token if needed
       }
     });
   }
 
   // Create an authentication session
   Future<void> _createAuthSession(String userId) async {
+    // Consider adding a check if a session already exists and is valid
+    // if (_sessionId != null && await isAuthSessionValid()) return;
+
     try {
       _sessionId = _generateSessionId();
       final authTime = DateTime.now().millisecondsSinceEpoch.toString();
@@ -125,20 +143,32 @@ class AuthService {
       await _secureStorage.write(key: _sessionKey, value: _sessionId);
       await _secureStorage.write(key: _authTimeKey, value: authTime);
 
-      AdvancedLogger.info(_tag, 'Authentication session created',
-          data: {'sessionId': _sessionId});
+      Logger.info(_tag, 'Authentication session created with session ID: $_sessionId');
 
       // Log authentication event to Firestore for audit trail
-      await _logAuthEvent(userId, 'login', {'sessionId': _sessionId});
+      // Moved this logging into the sign-in methods themselves to ensure it happens after specific login actions
+      // await _logAuthEvent(userId, 'login', {'sessionId': _sessionId});
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error creating auth session',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error creating auth session: $e\n$stackTrace');
     }
   }
 
+  // Helper to clear local session data
+  Future<void> _clearSessionData() async {
+    _sessionId = null;
+    await _secureStorage.delete(key: _sessionKey);
+    await _secureStorage.delete(key: _authTimeKey);
+    // Consider if other secure storage keys should be cleared on sign out
+    // await clearStoredCredentials(); // Maybe call this instead?
+  }
+
   // Log authentication events to Firestore
-  Future<void> _logAuthEvent(String userId, String eventType, Map<String, dynamic> data) async {
+  Future<void> _logAuthEvent(String userId, String eventType, Map<String, dynamic> eventData) async {
     try {
+      // Ensure eventData is not null and potentially add session ID automatically
+      final dataToLog = Map<String, dynamic>.from(eventData); // Create mutable copy
+      dataToLog['sessionId'] ??= _sessionId; // Add session ID if not already present
+
       await _firestore
           .collection('users')
           .doc(userId)
@@ -146,309 +176,517 @@ class AuthService {
           .add({
         'eventType': eventType,
         'timestamp': FieldValue.serverTimestamp(),
-        'data': data,
+        'eventData': dataToLog, // Use the potentially modified map
         'platform': defaultTargetPlatform.toString(),
       });
     } catch (e) {
-      AdvancedLogger.error(_tag, 'Failed to log auth event',
-          data: {'eventType': eventType, 'userId': userId});
+      // Consider propagating this error or handling it more visibly if logs are critical
+      Logger.error(_tag, 'Failed to log auth event ($eventType) for user $userId: $e');
     }
   }
 
-  // Check if the auth session is still valid
+  // ==========================================================================
+  // FREEMIUM SESSION MANAGEMENT
+  // ==========================================================================
+
+  Future<void> trackLogin() async {
+    // This function likely needs to be called explicitly after a successful login
+    // from initiateSignIn or signInWithEmailAndPassword if freemium tracking is needed.
+    try {
+      final user = currentUser; // Use the getter
+      if (user == null) return;
+
+      final userId = user.uid;
+
+      final isPremium = await _isPremiumUser(userId);
+      if (isPremium) {
+        Logger.info(_tag, 'Premium user login - not tracking usage limits');
+        return;
+      }
+
+      final metricsRef = _firestore.collection('userMetrics').doc(userId);
+
+      // Use a transaction for reliable read-modify-write
+      await _firestore.runTransaction((transaction) async {
+        final metricsDoc = await transaction.get(metricsRef);
+
+        if (metricsDoc.exists) {
+          final currentCount = metricsDoc.data()?['loginCount'] ?? 0;
+          transaction.update(metricsRef, {
+            'loginCount': currentCount + 1,
+            'lastLogin': FieldValue.serverTimestamp()
+          });
+          Logger.info(_tag, 'Login count updated to ${currentCount + 1} of $_freemiumMaxLogins maximum');
+          if (currentCount + 1 >= _freemiumMaxLogins) {
+            Logger.warning(_tag, 'User has reached free login limit');
+          }
+        } else {
+          transaction.set(metricsRef, {
+            'loginCount': 1,
+            'lastLogin': FieldValue.serverTimestamp()
+          });
+          Logger.info(_tag, 'First login recorded');
+        }
+      });
+
+      await _startSessionTimer(); // Start timer after successful tracking
+
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error tracking login: $e\n$stackTrace');
+    }
+  }
+
+  Future<bool> _isPremiumUser(String userId) async {
+    try {
+      final premiumDoc = await _firestore.collection('premiumUsers').doc(userId).get();
+      return premiumDoc.exists;
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error checking premium status: $e\n$stackTrace');
+      return false; // Assume not premium on error
+    }
+  }
+
+  Future<void> _startSessionTimer() async {
+    try {
+      final user = currentUser;
+      if (user == null) return;
+
+      // Don't start timer for premium users
+      if (await _isPremiumUser(user.uid)) return;
+
+      _sessionTimer?.cancel(); // Cancel existing timer
+
+      final userId = user.uid; // Use user.uid directly
+
+      final expirationTime = DateTime.now().add(
+          Duration(minutes: _freemiumSessionTimeoutMinutes)
+      ).millisecondsSinceEpoch;
+
+      // Record session start time and expiration in Firestore
+      // Consider if this write is necessary or if client-side timer is sufficient
+      await _firestore.collection('userSessions').doc(userId).set({
+        'lastLogin': FieldValue.serverTimestamp(),
+        'expiresAt': expirationTime
+      }, SetOptions(merge: true)); // Use set merge here too potentially
+
+      Logger.info(_tag, 'Freemium session started with timeout of $_freemiumSessionTimeoutMinutes minutes');
+
+      _sessionTimer = Timer(
+          Duration(minutes: _freemiumSessionTimeoutMinutes),
+              () {
+            // Check if the SAME user is still logged in before logging out
+            if (currentUser != null && currentUser!.uid == userId) {
+              Logger.info(_tag, 'Freemium session timeout - logging out user $userId');
+              signOut(); // Call sign out
+            } else {
+              Logger.info(_tag, 'Freemium session timer expired, but user already changed/logged out.');
+            }
+          }
+      );
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error starting session timer: $e\n$stackTrace');
+    }
+  }
+
+  Future<bool> hasReachedLoginLimit() async {
+    try {
+      final user = currentUser;
+      if (user == null) return false; // No user, no limit reached
+
+      final isPremium = await _isPremiumUser(user.uid);
+      if (isPremium) {
+        Logger.info(_tag, 'Premium user - no login limits');
+        return false;
+      }
+
+      final metricsDoc = await _firestore.collection('userMetrics')
+          .doc(user.uid).get();
+
+      if (!metricsDoc.exists) {
+        Logger.info(_tag, 'No metrics found, limit not reached.');
+        return false;
+      }
+
+      final loginCount = metricsDoc.data()?['loginCount'] ?? 0;
+      final hasReachedLimit = loginCount >= _freemiumMaxLogins;
+
+      if (hasReachedLimit) {
+        Logger.warning(_tag, 'User ${user.uid} has reached free login limit of $_freemiumMaxLogins');
+      }
+      return hasReachedLimit;
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error checking login limit: $e\n$stackTrace');
+      return false; // Default to false on error
+    }
+  }
+
   Future<bool> isSessionValid() async {
+    // This checks the freemium 5-minute timer, NOT the main 8-hour auth session
+    try {
+      final user = currentUser;
+      if (user == null) return false;
+
+      final isPremium = await _isPremiumUser(user.uid);
+      if (isPremium) {
+        Logger.info(_tag, 'Premium user - freemium session always valid');
+        return true;
+      }
+
+      // Client-side check is likely sufficient if timer is running
+      if (_sessionTimer != null && _sessionTimer!.isActive) {
+        return true;
+      }
+
+      // Optional: Check Firestore as fallback (adds latency)
+      /*
+      final sessionDoc = await _firestore.collection('userSessions')
+          .doc(user.uid).get();
+      if (!sessionDoc.exists) {
+        Logger.warning(_tag, 'No session record found in Firestore for freemium check.');
+        return false;
+      }
+      final expiresAt = sessionDoc.data()?['expiresAt'] as int?;
+      if (expiresAt == null) {
+         Logger.warning(_tag, 'Session missing expiration timestamp.');
+         return false;
+      }
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final isValid = now < expiresAt;
+       if (!isValid) {
+         Logger.info(_tag, 'Freemium session expired based on Firestore record.');
+       }
+       return isValid;
+       */
+
+      // If timer isn't active, assume session expired
+      Logger.info(_tag, 'Freemium session timer not active.');
+      return false;
+
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error checking freemium session validity: $e\n$stackTrace');
+      return false; // Default to invalid on error
+    }
+  }
+
+  // ==========================================================================
+  // STANDARD SESSION / LOCKOUT / CREDENTIALS
+  // ==========================================================================
+
+  Future<bool> isAuthSessionValid() async {
+    // Checks the main 8-hour session based on secure storage time
     try {
       final authTimeString = await _secureStorage.read(key: _authTimeKey);
-      if (authTimeString == null) return false;
+      if (authTimeString == null) {
+        Logger.info(_tag, 'No auth time found in secure storage.');
+        return false;
+      }
 
-      final authTime = int.tryParse(authTimeString) ?? 0;
+      final authTime = int.tryParse(authTimeString);
+      if (authTime == null) {
+        Logger.warning(_tag, 'Invalid auth time format found.');
+        await _secureStorage.delete(key: _authTimeKey); // Clean up invalid data
+        return false;
+      }
+
       final now = DateTime.now().millisecondsSinceEpoch;
-
-      // Check if session has expired (8 hours)
       final elapsed = now - authTime;
-      final hourInMillis = 60 * 60 * 1000;
+      final sessionDurationMillis = _sessionTimeoutHours * 60 * 60 * 1000;
 
-      if (elapsed > _sessionTimeoutHours * hourInMillis) {
-        AdvancedLogger.info(_tag, 'Auth session expired',
-            data: {'elapsedHours': elapsed / hourInMillis});
+      if (elapsed > sessionDurationMillis) {
+        Logger.info(_tag, 'Auth session expired after ${elapsed / (60 * 60 * 1000)} hours');
         return false;
       }
 
       return true;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error checking session validity',
-          error: e, stackTrace: stackTrace);
-      return false;
+      Logger.error(_tag, 'Error checking auth session validity: $e\n$stackTrace');
+      return false; // Default to invalid on error
     }
   }
 
-  // Check for account lockout due to failed attempts
   Future<bool> _isAccountLocked() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final attempts = prefs.getInt(_failedAttemptsKey) ?? 0;
-      final lastAttemptTime = prefs.getInt(_lastFailedAttemptKey) ?? 0;
+      final lastAttemptTime = prefs.getInt(_lastFailedAttemptKey); // Can be null
 
-      if (attempts >= _maxFailedAttempts) {
+      if (attempts >= _maxFailedAttempts && lastAttemptTime != null) {
         final now = DateTime.now().millisecondsSinceEpoch;
-        final minutesElapsed = (now - lastAttemptTime) / (1000 * 60);
+        final lockoutDurationMillis = _lockoutMinutes * 60 * 1000;
 
-        if (minutesElapsed < _lockoutMinutes) {
-          AdvancedLogger.warning(_tag, 'Account temporarily locked due to failed attempts',
-              data: {
-                'attempts': attempts,
-                'minutesRemaining': _lockoutMinutes - minutesElapsed.floor(),
-              });
+        if ((now - lastAttemptTime) < lockoutDurationMillis) {
+          final minutesRemaining = _lockoutMinutes - ((now - lastAttemptTime) / (1000 * 60)).floor();
+          Logger.warning(_tag, 'Account temporarily locked. Attempts: $attempts. Minutes remaining: $minutesRemaining');
           return true;
         } else {
-          // Reset counter if lockout period has passed
-          await prefs.setInt(_failedAttemptsKey, 0);
+          // Lockout period has passed, reset counter before allowing login attempt
+          Logger.info(_tag, 'Lockout period expired, resetting attempts.');
+          await _resetFailedAttempts(); // Use the reset method
         }
       }
-
       return false;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error checking account lockout',
-          error: e, stackTrace: stackTrace);
-      return false;
+      Logger.error(_tag, 'Error checking account lockout: $e\n$stackTrace');
+      return false; // Default to not locked on error
     }
   }
 
-  // Record a failed login attempt
   Future<void> _recordFailedAttempt() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final attempts = prefs.getInt(_failedAttemptsKey) ?? 0;
-
-      await prefs.setInt(_failedAttemptsKey, attempts + 1);
+      // Use null-aware operator and default value
+      final attempts = (prefs.getInt(_failedAttemptsKey) ?? 0) + 1;
+      await prefs.setInt(_failedAttemptsKey, attempts);
       await prefs.setInt(_lastFailedAttemptKey, DateTime.now().millisecondsSinceEpoch);
-
-      AdvancedLogger.warning(_tag, 'Failed login attempt recorded',
-          data: {'attemptCount': attempts + 1, 'maxAttempts': _maxFailedAttempts});
+      Logger.warning(_tag, 'Failed login attempt recorded: $attempts of $_maxFailedAttempts maximum');
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error recording failed attempt',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error recording failed attempt: $e\n$stackTrace');
     }
   }
 
-  // Reset failed login attempts counter
   Future<void> _resetFailedAttempts() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt(_failedAttemptsKey, 0);
+      await prefs.remove(_failedAttemptsKey); // Use remove instead of setting to 0
+      await prefs.remove(_lastFailedAttemptKey);
+      Logger.info(_tag, 'Failed login attempts counter reset successfully');
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error resetting failed attempts',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error resetting failed attempts: $e\n$stackTrace');
     }
   }
 
-  // Sign up with email and password - FIXED method with error handling for type conversion
+  Future<void> resetLoginAttempts() async {
+    // Public access to reset logic
+    await _resetFailedAttempts();
+  }
+
+  // ===================================================================
+  // SIGN UP METHOD
+  // ===================================================================
   Future<UserCredential> signUpWithEmailAndPassword(
       String email, String password, String name, int age) async {
+    // Note: This method is kept largely as provided, assuming its logic is intended.
+    // The primary fix was needed in the sign-in methods.
     try {
-      // Sanitize email for logging
       final maskedEmail = _maskEmail(email);
-      AdvancedLogger.info(_tag, 'Attempting to create user',
-          data: {'email': maskedEmail, 'name': name, 'age': age});
+      Logger.info(_tag, 'Attempting sign up: $maskedEmail, name: $name');
 
       // Check for existing user first
       try {
         final methods = await _auth.fetchSignInMethodsForEmail(email);
         if (methods.isNotEmpty) {
-          AdvancedLogger.warning(_tag, 'Attempted to create account with existing email',
-              data: {'email': maskedEmail});
-
+          Logger.warning(_tag, 'Sign up attempt with existing email: $maskedEmail');
           throw AuthException(
             message: 'This email address is already registered. Please sign in or use a different email.',
             code: 'email-already-in-use',
             isRecoverable: true,
           );
         }
+      } on FirebaseAuthException catch (e) {
+        // Handle specific auth exceptions during check if necessary
+        Logger.warning(_tag, 'FirebaseAuthException checking existing email ($maskedEmail): ${e.code}');
+        // Decide if specific codes should halt signup (e.g., network error)
+        if (e.code == 'invalid-email') throw AuthException(message: _getReadableErrorMessage(e), code: e.code);
+        // Otherwise, proceed, createUserWithEmailAndPassword will handle 'email-already-in-use' definitively.
       } catch (e) {
-        AdvancedLogger.warning(_tag, 'Error checking existing email', error: e);
-        // If the check fails, continue with account creation
-        // The Firebase createUserWithEmailAndPassword will catch duplicates anyway
+        Logger.warning(_tag, 'Non-Firebase error checking existing email ($maskedEmail): $e');
+        // Proceed with caution, createUserWithEmailAndPassword is the final check.
       }
 
-      // Validate password strength
       _validatePasswordStrength(password);
 
-      // Create user with email and password
-      final userCredential = await _auth.createUserWithEmailAndPassword(
-        email: email,
-        password: password,
-      );
+      UserCredential? userCredential; // Make nullable
+      try {
+        userCredential = await _auth.createUserWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+      } on FirebaseAuthException catch (e) {
+        // Catch specific auth errors during creation itself
+        Logger.error(_tag, 'FirebaseAuthException during createUser: ${e.code}');
+        throw AuthException(message: _getReadableErrorMessage(e), code: e.code, isRecoverable: _isRecoverableError(e.code));
+      } on TypeError catch (e, stackTrace) {
+        // This catch block specifically handles the Pigeon type error if it occurs during creation
+        Logger.error(_tag, 'Type error during user creation (Pigeon?): $e\n$stackTrace');
+        throw AuthException(
+          message: 'Authentication system error during user creation. Please try again later.',
+          code: 'auth_type_error',
+        );
+      }
+      // Note: removed the outer generic try-catch for userCredential assignment
 
-      // Add user details to Firestore after successful account creation
-      if (userCredential.user != null) {
-        final userId = userCredential.user!.uid;
-        AdvancedLogger.info(_tag, 'User created successfully',
-            data: {'uid': userId});
+      // Process successful creation
+      final user = userCredential.user; // Nullable User?
+
+      if (user != null) {
+        final userId = user.uid; // Safe access inside null check
+        Logger.info(_tag, 'User created successfully with UID: $userId');
+
+        // Removed delay, generally not needed unless specific timing issue known
+        // await Future.delayed(const Duration(milliseconds: 500));
 
         try {
-          // Store user profile in Firestore
+          // Set user profile in Firestore - this uses .set() which is correct for creation
           await _firestore.collection('users').doc(userId).set({
             'name': name,
-            'email': email,
+            'email': email, // Use original email from args, as user.email might be null briefly
             'age': age,
             'createdAt': FieldValue.serverTimestamp(),
-            'lastLogin': FieldValue.serverTimestamp(),
+            'lastLogin': FieldValue.serverTimestamp(), // Set initial lastLogin
             'lastUpdated': FieldValue.serverTimestamp(),
-            'profileComplete': true,
-            'mfaEnabled': false, // Starting with MFA disabled for simplicity
+            'profileComplete': true, // Example field
+            'mfaEnabled': false, // Default
           });
+          Logger.info(_tag, 'User profile saved to Firestore for $userId');
 
-          AdvancedLogger.info(_tag, 'User profile saved to Firestore');
+          // Update display name (best effort)
+          try {
+            await user.updateDisplayName(name);
+          } catch (e) {
+            Logger.warning(_tag, 'Failed to update display name for $userId: $e');
+          }
 
-          // Update display name
-          await userCredential.user!.updateDisplayName(name);
+          // Generate salt (best effort)
+          try {
+            await _generateAndStoreSalt();
+          } catch (e) {
+            Logger.warning(_tag, 'Failed to generate/store salt for $userId: $e');
+          }
 
-          // Generate a secure salt for this user
-          await _generateAndStoreSalt();
-
-          // Set MFA preference
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setBool(_mfaEnabledKey, false);
+          // Set local prefs (best effort)
+          try {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setBool(_mfaEnabledKey, false);
+          } catch (e) {
+            Logger.warning(_tag, 'Failed to save MFA pref for $userId: $e');
+          }
 
           // Log signup event
           await _logAuthEvent(userId, 'signup', {
             'method': 'email',
-            'age': age,
-            'name': name.substring(0, min(3, name.length)) + '***'
+            'age': age, // Consider privacy implications of logging age
+            'namePrefix': name.isNotEmpty ? name.substring(0, min(3, name.length)) + '***' : '***'
           });
-        } catch (firestoreError) {
-          AdvancedLogger.error(_tag, 'Error saving user profile to Firestore',
-              error: firestoreError);
 
-          // Clean up: Delete the user if we can't save the profile
+        } catch (firestoreError, stackTrace) { // Catch specific Firestore errors during set
+          Logger.error(_tag, 'Error saving user profile to Firestore for $userId: $firestoreError\n$stackTrace');
+          // Clean up: Attempt to delete the Auth user since profile failed
           try {
-            await userCredential.user!.delete();
-            AdvancedLogger.info(_tag, 'User account deleted after Firestore error');
+            await user.delete();
+            Logger.info(_tag, 'User account $userId deleted after Firestore profile save error');
           } catch (deleteError) {
-            AdvancedLogger.error(_tag, 'Error deleting user after Firestore error',
-                error: deleteError);
+            Logger.error(_tag, 'CRITICAL: Error deleting user $userId after Firestore error: $deleteError. Manual cleanup needed.');
+            // Throw a more critical error?
           }
-
+          // Throw specific exception indicating profile save failure
           throw AuthException(
-            message: 'Account created but profile could not be saved. Please try again.',
+            message: 'Your account was created, but saving your profile failed. Please try signing up again.',
             code: 'profile_creation_error',
           );
         }
+      } else {
+        // This case should ideally not be reached if createUser returns without error but null user
+        Logger.error(_tag, 'User creation successful but User object is null.');
+        throw AuthException(
+          message: 'Account creation failed unexpectedly. Please try again.',
+          code: 'unknown_creation_error',
+        );
       }
 
-      return userCredential;
-    } on FirebaseAuthException catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Firebase Auth Error during sign up',
-          error: e, stackTrace: stackTrace,
-          data: {'code': e.code, 'message': e.message});
+      return userCredential; // Return the original credential
 
+    } on FirebaseAuthException catch (e, stackTrace) {
+      // Handle exceptions specifically from initial email check or createUser
+      Logger.error(_tag, 'FirebaseAuthException during sign up process: ${e.code}\n$stackTrace');
       throw AuthException(
         message: _getReadableErrorMessage(e),
         code: e.code,
         isRecoverable: _isRecoverableError(e.code),
       );
     } on AuthException {
-      // Pass through custom auth exceptions
+      // Re-throw custom exceptions (like email-already-in-use, weak_password, profile_creation_error)
       rethrow;
+    } on TypeError catch (e, stackTrace) {
+      // Catch TypeErrors that might occur outside the specific creation block
+      Logger.error(_tag, 'Type casting error during sign up: $e\n$stackTrace');
+      throw AuthException(
+        message: 'A technical issue occurred during signup. Please try again later.',
+        code: 'type_error', // Generic type error code
+        isRecoverable: true,
+      );
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error during sign up',
-          error: e, stackTrace: stackTrace);
-
+      // Catch-all for other unexpected errors
+      Logger.error(_tag, 'Unexpected error during sign up: $e\n$stackTrace');
       throw AuthException(
         message: 'An unexpected error occurred during sign up. Please try again.',
-        code: 'unknown_error',
+        code: 'unknown_signup_error', // More specific code
       );
     }
   }
 
-  // Validate password strength
+  // ===================================================================
+  // SIGN UP HELPER METHODS
+  // ===================================================================
+
   void _validatePasswordStrength(String password) {
     List<String> weaknesses = [];
-    // Check password length
-    if (password.length < 8) {
-      weaknesses.add('at least 8 characters long');
-    }
-
-    // Check for password complexity
-    bool hasUppercase = password.contains(RegExp(r'[A-Z]'));
-    bool hasLowercase = password.contains(RegExp(r'[a-z]'));
-    bool hasDigits = password.contains(RegExp(r'[0-9]'));
-    bool hasSpecialChars = password.contains(RegExp(r'[!@#\$%^&*(),.?":{}|<>]'));
-
-    if (!hasUppercase) weaknesses.add('at least one uppercase letter');
-    if (!hasLowercase) weaknesses.add('at least one lowercase letter');
-    if (!hasDigits) weaknesses.add('at least one number');
-    if (!hasSpecialChars) weaknesses.add('at least one special character (!@#\$%^&*(),.?":{}|<>)');
+    if (password.length < 8) weaknesses.add('at least 8 characters long');
+    if (!password.contains(RegExp(r'[A-Z]'))) weaknesses.add('at least one uppercase letter');
+    if (!password.contains(RegExp(r'[a-z]'))) weaknesses.add('at least one lowercase letter');
+    if (!password.contains(RegExp(r'[0-9]'))) weaknesses.add('at least one number');
+    if (!password.contains(RegExp(r'[!@#\$%^&*(),.?":{}|<>]'))) weaknesses.add('at least one special character (!@#\$%^&*(),.?":{}|<>)');
 
     if (weaknesses.isNotEmpty) {
-      // Format the message nicely
       String message;
       if (weaknesses.length == 1) {
-        message = 'Password must contain ${weaknesses[0]}';
+        message = 'Password must contain ${weaknesses[0]}.';
       } else {
         final lastItem = weaknesses.removeLast();
-        message = 'Password must contain ${weaknesses.join(", ")} and $lastItem';
+        message = 'Password must contain ${weaknesses.join(", ")}, and $lastItem.';
       }
-      throw AuthException(
-        message: message,
-        code: 'weak_password',
-      );
+      throw AuthException(message: message, code: 'weak-password');
     }
   }
 
-  // Generate a more user-friendly error message
   String _getReadableErrorMessage(FirebaseAuthException e) {
+    // Kept as provided, seems reasonable
     switch (e.code) {
-      case 'email-already-in-use':
-        return 'This email address is already registered. Please sign in or use a different email.';
-      case 'invalid-email':
-        return 'The email address format is invalid. Please check and try again.';
-      case 'operation-not-allowed':
-        return 'Email/password accounts are not enabled. Please contact support.';
-      case 'weak-password':
-        return 'The password provided is too weak. Please use a stronger password with at least 8 characters including uppercase letters, numbers, and special characters.';
-      case 'user-disabled':
-        return 'This account has been disabled. Please contact support for assistance';
-      case 'user-not-found':
-        return 'We couldn\'t find an account with this email. Please check your email or sign up.';
-      case 'wrong-password':
-        return 'Invalid email or password. Please try again with the correct email and password.';
-      case 'too-many-requests':
-        return 'Access to this account has been temporarily disabled due to many failed login attempts. Please try again later.';
-      case 'network-request-failed':
-        return 'A network error occurred. Please check your internet connection and try again.';
-      case 'invalid-credential':
-        return 'The login information you provided is incorrect. Please check your email and password.';
-      default:
-        return e.message ?? 'An unknown error occurred. Please try again.';
+      case 'email-already-in-use': return 'This email address is already registered. Please sign in or use a different email.';
+      case 'invalid-email': return 'The email address format is invalid. Please check and try again.';
+      case 'operation-not-allowed': return 'Email/password accounts are not enabled. Please contact support.';
+      case 'weak-password': return 'The password provided is too weak. Please use a stronger password with at least 8 characters including uppercase letters, numbers, and special characters.';
+      case 'user-disabled': return 'This account has been disabled. Please contact support for assistance.';
+      case 'user-not-found': return 'We couldn\'t find an account with this email. Please check your email or sign up.';
+      case 'wrong-password': return 'Invalid email or password. Please try again with the correct email and password.';
+      case 'too-many-requests': return 'Access to this account has been temporarily disabled due to many failed login attempts. Please try again later or reset your password.';
+      case 'network-request-failed': return 'A network error occurred. Please check your internet connection and try again.';
+      case 'invalid-credential': return 'The login information you provided is incorrect. Please check your email and password.';
+    // Add more specific cases if needed based on Firebase docs
+      default: return e.message ?? 'An unknown authentication error occurred. Please try again.';
     }
   }
 
-  // Determine if an error is potentially recoverable
   bool _isRecoverableError(String errorCode) {
-    final nonRecoverableCodes = [
-      'user-disabled',
-      'operation-not-allowed',
-    ];
-
+    // Kept as provided
+    final nonRecoverableCodes = ['user-disabled', 'operation-not-allowed'];
     return !nonRecoverableCodes.contains(errorCode);
   }
 
-  // MULTI-FACTOR AUTHENTICATION METHODS
 
-  // Check if MFA is enabled for the current user
+  // ==========================================================================
+  // MFA METHODS - Kept as provided, review if MFA flow is used
+  // ==========================================================================
+
   Future<bool> isMfaEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       return prefs.getBool(_mfaEnabledKey) ?? false; // Default to false for better adoption
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error checking MFA status',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error checking MFA status: $e\n$stackTrace');
       return false; // Default to false to allow users to sign in
     }
   }
 
-  // Enable or disable MFA
   Future<void> setMfaEnabled(bool enabled) async {
     try {
       if (currentUser == null) {
@@ -467,14 +705,12 @@ class AuthService {
         'lastUpdated': FieldValue.serverTimestamp(),
       });
 
-      AdvancedLogger.info(_tag, 'MFA setting updated',
-          data: {'enabled': enabled, 'uid': currentUser!.uid});
+      Logger.info(_tag, 'MFA setting updated to: $enabled for user: ${currentUser!.uid}');
 
       // Log MFA setting change
       await _logAuthEvent(currentUser!.uid, 'mfa_setting_change', {'enabled': enabled});
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error updating MFA setting',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error updating MFA setting: $e\n$stackTrace');
       throw AuthException(
         message: 'Failed to update MFA settings. Please try again.',
         code: 'mfa_setting_error',
@@ -482,13 +718,11 @@ class AuthService {
     }
   }
 
-  // Generate a random 6-digit verification code
   String _generateVerificationCode() {
     final random = Random.secure();
     return (100000 + random.nextInt(900000)).toString(); // 6-digit code
   }
 
-  // Send MFA verification code to user's email
   Future<void> sendMfaVerificationCode(String email) async {
     try {
       // Generate a 6-digit code
@@ -509,22 +743,20 @@ class AuthService {
       if (currentUser != null) {
         final userDoc = await _firestore.collection('users').doc(currentUser!.uid).get();
         if (userDoc.exists && userDoc.data()?['name'] != null) {
-          userName = userDoc.data()!['name'];
+          userName = userDoc.data()!['name'] as String;
         }
       }
 
       // Send verification code email (using your email service)
       await _sendVerificationEmail(email, verificationCode, userName);
 
-      AdvancedLogger.info(_tag, 'MFA verification code sent',
-          data: {'email': _maskEmail(email)});
+      Logger.info(_tag, 'MFA verification code sent to: ${_maskEmail(email)}');
 
       // Set MFA verification flow flag
       _isMfaVerificationFlow = true;
 
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error sending MFA verification code',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error sending MFA verification code: $e\n$stackTrace');
       throw AuthException(
         message: 'Failed to send verification code. Please try again.',
         code: 'mfa_code_error',
@@ -532,15 +764,13 @@ class AuthService {
     }
   }
 
-  // Send the verification email (implement with your email service)
   Future<void> _sendVerificationEmail(String email, String code, String userName) async {
     try {
       // Here you should integrate with your email sending service
       // For example, Firebase Cloud Functions, SendGrid, or another email service
 
       // For this example, we'll log this action and assume the email is sent
-      AdvancedLogger.info(_tag, 'Sending verification email',
-          data: {'email': _maskEmail(email), 'codeLength': code.length});
+      Logger.info(_tag, 'Sending verification email to: ${_maskEmail(email)}, code length: ${code.length}');
 
       // In a real implementation, you would send an actual email with the code
       // Example with Firebase Cloud Functions:
@@ -558,14 +788,12 @@ class AuthService {
       // NEVER log actual codes in production!
       assert(() {
         // Only in debug mode
-        AdvancedLogger.debug(_tag, 'TEST MODE: Generated verification code',
-            data: {'code': code});
+        Logger.debug(_tag, 'TEST MODE: Generated verification code: $code');
         return true;
       }());
 
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error sending email',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error sending email: $e\n$stackTrace');
       throw AuthException(
         message: 'Could not send verification email. Please try again.',
         code: 'email_send_error',
@@ -573,7 +801,6 @@ class AuthService {
     }
   }
 
-  // Verify MFA code
   Future<bool> verifyMfaCode(String code) async {
     try {
       // Get stored verification code and timestamp
@@ -581,7 +808,7 @@ class AuthService {
       final timestampStr = await _secureStorage.read(key: _mfaVerificationTimeKey);
 
       if (storedCodeHash == null || timestampStr == null) {
-        AdvancedLogger.warning(_tag, 'No verification code found');
+        Logger.warning(_tag, 'No verification code found');
         return false;
       }
 
@@ -591,8 +818,7 @@ class AuthService {
       final minutesElapsed = (now - timestamp) / (1000 * 60);
 
       if (minutesElapsed > _mfaCodeValidityMinutes) {
-        AdvancedLogger.warning(_tag, 'Verification code expired',
-            data: {'minutesElapsed': minutesElapsed.floor()});
+        Logger.warning(_tag, 'Verification code expired after $minutesElapsed minutes');
         return false;
       }
 
@@ -600,8 +826,7 @@ class AuthService {
       final hashedCode = _hashVerificationCode(code);
       final isValid = hashedCode == storedCodeHash;
 
-      AdvancedLogger.info(_tag, 'MFA code verification',
-          data: {'valid': isValid});
+      Logger.info(_tag, 'MFA code verification result: $isValid');
 
       // Clear verification data after verification
       if (isValid) {
@@ -614,30 +839,31 @@ class AuthService {
 
       return isValid;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error verifying MFA code',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error verifying MFA code: $e\n$stackTrace');
       return false;
     }
   }
 
-  // Hash the verification code for secure storage
   String _hashVerificationCode(String code) {
     final bytes = utf8.encode(code);
     final hash = sha256.convert(bytes);
     return hash.toString();
   }
 
-  // The first step of sign-in process - SIMPLIFIED for easier adoption
+  // ==========================================================================
+  // SIGN IN METHODS - UPDATED
+  // ==========================================================================
+
+  // Use this as the primary sign-in method now? Or keep both? Assuming initiateSignIn is preferred.
   Future<void> initiateSignIn(String email, String password) async {
     try {
-      // Check for account lockout
       if (await _isAccountLocked()) {
+        // Logic to calculate remaining time and throw specific locked exception
         final prefs = await SharedPreferences.getInstance();
         final lastAttemptTime = prefs.getInt(_lastFailedAttemptKey) ?? 0;
         final now = DateTime.now().millisecondsSinceEpoch;
         final minutesElapsed = (now - lastAttemptTime) / (1000 * 60);
         final minutesRemaining = _lockoutMinutes - minutesElapsed.floor();
-
         throw AuthException(
           message: 'Your account is temporarily locked due to too many failed login attempts. Please try again in $minutesRemaining minutes or reset your password.',
           code: 'account_locked',
@@ -645,129 +871,182 @@ class AuthService {
         );
       }
 
-      // Sanitize email for logging
       final maskedEmail = _maskEmail(email);
-      AdvancedLogger.info(_tag, 'Initiating sign in process',
-          data: {'email': maskedEmail});
+      Logger.info(_tag, 'Initiating sign in process for email: $maskedEmail');
 
-      // Simplified sign-in flow - try direct sign in
+      // Direct sign-in attempt
+      UserCredential? userCredential; // Make nullable
       try {
-        final userCredential = await _auth.signInWithEmailAndPassword(
+        userCredential = await _auth.signInWithEmailAndPassword(
           email: email,
           password: password,
         );
-
-        if (userCredential.user != null) {
-          final userId = userCredential.user!.uid;
-          AdvancedLogger.info(_tag, 'User signed in successfully',
-              data: {'uid': userId});
-
-          // Reset failed attempts counter on successful login
-          await _resetFailedAttempts();
-
-          // Save remember me preference and email
-          await saveCredentials(email, true);
-
-          // Update last login timestamp
-          await _firestore.collection('users').doc(userId).update({
-            'lastLogin': FieldValue.serverTimestamp(),
-          });
-
-          // Create new auth session
-          await _createAuthSession(userId);
-
-          // Log login event
-          await _logAuthEvent(userId, 'login', {
-            'method': 'email',
-          });
-        }
       } on FirebaseAuthException catch (e) {
-        AdvancedLogger.error(_tag, 'Firebase Auth Error during sign in',
-            error: e, data: {'code': e.code, 'message': e.message});
-
-        // Record failed attempt
-        await _recordFailedAttempt();
-
-        throw AuthException(
-          message: _getReadableErrorMessage(e),
-          code: e.code,
-          isRecoverable: _isRecoverableError(e.code),
-        );
+        // Handle AUTH errors during sign-in attempt
+        Logger.error(_tag, 'FirebaseAuthException during signIn: ${e.code} - ${e.message}');
+        await _recordFailedAttempt(); // Record failure
+        throw AuthException( message: _getReadableErrorMessage(e), code: e.code, isRecoverable: _isRecoverableError(e.code));
+      } on TypeError catch (e, stackTrace) {
+        // Handle specific type errors during sign-in (Pigeon?)
+        Logger.error(_tag, 'Type error during sign in: $e\n$stackTrace');
+        await _recordFailedAttempt(); // Record failure
+        throw AuthException( message: 'Authentication system error during sign in. Please try again later.', code: 'auth_type_error');
       }
+
+      // Process successful sign-in credential
+      final user = userCredential?.user; // Use null-aware access
+
+      if (user != null) {
+        final userId = user.uid; // Safe access inside check
+        Logger.info(_tag, 'User signed in successfully with UID: $userId');
+
+        await _resetFailedAttempts(); // Reset on success
+        await Future.delayed(const Duration(milliseconds: 100)); // Reduced delay slightly
+
+        // Save credentials if remember me is used (consider if needed here)
+        // This depends on where rememberMe preference is set by the UI
+        // Assuming it's handled elsewhere or default true for now:
+        await saveCredentials(email, true);
+
+        // <<<<< START: FIXED Firestore Interaction >>>>>
+        try {
+          // Directly use set with a map literal instead of building updateData
+          // This avoids the type error by keeping the email assignment inside the map literal
+          await _firestore.collection('users').doc(userId).set({
+            'lastLogin': FieldValue.serverTimestamp(),
+            if (user.email != null) 'email': user.email
+          }, SetOptions(merge: true));
+
+          Logger.info(_tag, 'Updated lastLogin for user $userId');
+        } catch (e, stackTrace) {
+          // Log error but don't necessarily block login if only timestamp fails
+          Logger.error(_tag, 'Failed to update Firestore on login for $userId: $e\n$stackTrace');
+          // Could potentially throw a non-fatal warning or custom exception here if needed
+        }
+        // <<<<< END: FIXED Firestore Interaction >>>>>
+
+        // Create session and log event (best effort)
+        try {
+          await _createAuthSession(userId); // Uses userId
+          await _logAuthEvent(userId, 'login', {'method': 'email'}); // Uses userId
+        } catch (e) {
+          Logger.error(_tag, 'Error during post-login session/logging for $userId: $e');
+        }
+
+        // Call freemium tracking if needed for this flow
+        // await trackLogin();
+
+      } else {
+        // Should not happen if signInWithEmailAndPassword returns successfully without user
+        // But handle defensively
+        Logger.error(_tag, 'Sign in successful but User object is null.');
+        // We likely threw an exception already in the try/catch block above if auth failed
+        // If we reach here, it's an unexpected state.
+        throw AuthException(message: 'Sign in failed unexpectedly.', code: 'unknown_signin_error');
+      }
+
+    } on AuthException {
+      // Re-throw specific AuthExceptions (locked, auth errors, type errors)
+      rethrow;
     } catch (e, stackTrace) {
-      if (e is AuthException) {
-        rethrow;
-      }
-
-      AdvancedLogger.error(_tag, 'Error during sign in',
-          error: e, stackTrace: stackTrace);
-
-      // Record failed attempt for unexpected errors
-      await _recordFailedAttempt();
-
+      // Catch-all for other unexpected errors during the process
+      Logger.error(_tag, 'Unexpected error during initiateSignIn: $e\n$stackTrace');
+      // Don't record failed attempt here if it was already recorded in specific catches
       throw AuthException(
         message: 'An unexpected error occurred during sign in. Please try again.',
-        code: 'unknown_error',
+        code: 'unknown_error', // Generic code
       );
     }
   }
 
-  // Sign in with email and password - SIMPLIFIED
+
+  // Consider if this separate method is still needed or if initiateSignIn covers all cases.
+  // If kept, it needs the same Firestore robustness update.
   Future<UserCredential> signInWithEmailAndPassword(
       String email, String password) async {
     try {
-      // Sanitize email for logging
-      final maskedEmail = _maskEmail(email);
-      AdvancedLogger.info(_tag, 'Signing in with email and password',
-          data: {'email': maskedEmail});
-
-      // Direct Firebase sign in
-      final credential = await _auth.signInWithEmailAndPassword(
-        email: email,
-        password: password,
-      );
-
-      if (credential.user != null) {
-        final userId = credential.user!.uid;
-        AdvancedLogger.info(_tag, 'User signed in successfully',
-            data: {'uid': userId});
-
-        // Reset failed attempts
-        await _resetFailedAttempts();
-
-        // Update last login timestamp
-        await _firestore.collection('users').doc(userId).update({
-          'lastLogin': FieldValue.serverTimestamp(),
-        });
-
-        // Create auth session
-        await _createAuthSession(userId);
-
-        // Log login event
-        await _logAuthEvent(userId, 'login', {'method': 'email'});
+      // Check for account lockout (duplicate logic from initiateSignIn - maybe refactor?)
+      if (await _isAccountLocked()) {
+        final prefs = await SharedPreferences.getInstance();
+        final lastAttemptTime = prefs.getInt(_lastFailedAttemptKey) ?? 0;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final minutesElapsed = (now - lastAttemptTime) / (1000 * 60);
+        final minutesRemaining = _lockoutMinutes - minutesElapsed.floor();
+        throw AuthException( message: 'Your account is temporarily locked...', code: 'account_locked', isRecoverable: false );
       }
 
-      return credential;
-    } on FirebaseAuthException catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Firebase Auth Error during sign in',
-          error: e, stackTrace: stackTrace,
-          data: {'code': e.code, 'message': e.message});
+      final maskedEmail = _maskEmail(email);
+      Logger.info(_tag, 'Executing signInWithEmailAndPassword for: $maskedEmail');
 
-      // Record failed attempt
-      await _recordFailedAttempt();
+      UserCredential? credential; // Make nullable
+      try {
+        credential = await _auth.signInWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+      } on FirebaseAuthException catch (e) {
+        Logger.error(_tag, 'FirebaseAuthException during direct signIn: ${e.code}');
+        await _recordFailedAttempt();
+        throw AuthException(message: _getReadableErrorMessage(e), code: e.code, isRecoverable: _isRecoverableError(e.code));
+      } on TypeError catch (e, stackTrace) {
+        Logger.error(_tag, 'Type error during direct sign in: $e\n$stackTrace');
+        await _recordFailedAttempt();
+        throw AuthException(message: 'Authentication system error.', code: 'auth_type_error');
+      }
 
-      throw AuthException(
-        message: _getReadableErrorMessage(e),
-        code: e.code,
-        isRecoverable: _isRecoverableError(e.code),
-      );
+      final user = credential?.user; // Use null-aware access
+
+      if (user != null) {
+        final userId = user.uid; // Safe access
+        Logger.info(_tag, 'Direct sign in successful with UID: $userId');
+
+        await Future.delayed(const Duration(milliseconds: 100)); // Reduced delay
+        await _resetFailedAttempts();
+
+        // <<<<< START: FIXED Firestore Interaction >>>>>
+        try {
+          // Directly use set with a map literal instead of building updateData
+          // This avoids the type error by keeping the email assignment inside the map literal
+          await _firestore.collection('users').doc(userId).set({
+            'lastLogin': FieldValue.serverTimestamp(),
+            if (user.email != null) 'email': user.email
+          }, SetOptions(merge: true));
+
+          Logger.info(_tag, 'Updated lastLogin for user $userId');
+        } catch (e, stackTrace) {
+          Logger.error(_tag, 'Failed to update Firestore on direct login for $userId: $e\n$stackTrace');
+          // Decide if this should block returning the credential
+        }
+        // <<<<< END: FIXED Firestore Interaction >>>>>
+
+        // Create session and log event (best effort)
+        try {
+          await _createAuthSession(userId);
+          await _logAuthEvent(userId, 'login', {'method': 'email'});
+        } catch (e) {
+          Logger.error(_tag, 'Error during post-login session/logging for $userId: $e');
+        }
+
+        // Call freemium tracking if needed for this flow
+        // await trackLogin();
+
+      } else {
+        // If user is null after successful call (shouldn't happen)
+        Logger.error(_tag, 'Direct sign in successful but User object is null.');
+        throw AuthException(message: 'Sign in failed unexpectedly.', code: 'unknown_signin_error');
+      }
+
+      // Return the original credential, which might have a null user if sign-in failed
+      // The calling code should handle the credential.user check again if needed
+      // However, exceptions are thrown on failure, so credential should be non-null with non-null user if reached here without error.
+      return credential!; // Can assert non-null if exceptions guarantee success
+
+    } on AuthException {
+      rethrow; // Pass through known auth exceptions
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error during sign in',
-          error: e, stackTrace: stackTrace);
-
-      // Record failed attempt
-      await _recordFailedAttempt();
-
+      // Catch-all for other unexpected errors
+      Logger.error(_tag, 'Unexpected error during signInWithEmailAndPassword: $e\n$stackTrace');
+      // Don't record failed attempt here if already recorded
       throw AuthException(
         message: 'An unexpected error occurred during sign in. Please try again.',
         code: 'unknown_error',
@@ -775,299 +1054,293 @@ class AuthService {
     }
   }
 
-  // Sign out
+  // ==========================================================================
+  // SIGN OUT / PASSWORD RESET
+  // ==========================================================================
+
   Future<void> signOut() async {
     try {
-      final userId = currentUser?.uid;
+      _sessionTimer?.cancel(); // Cancel freemium timer if active
 
-      // Clear stored credentials when signing out
-      await clearStoredCredentials();
+      final userId = currentUser?.uid; // Get UID before signing out
 
-      // Log the sign-out event before actually signing out
+      // Log the sign-out event before actually signing out (best effort)
       if (userId != null) {
-        await _logAuthEvent(userId, 'logout', {'sessionId': _sessionId});
+        try {
+          await _logAuthEvent(userId, 'logout', {'sessionId': _sessionId});
+        } catch (e) {
+          Logger.error(_tag, 'Failed to log signout event for $userId: $e');
+        }
       }
 
-      await _auth.signOut();
+      await _auth.signOut(); // Perform Firebase sign out
 
-      AdvancedLogger.info(_tag, 'User signed out successfully');
+      Logger.info(_tag, 'User signed out successfully.');
 
-      // Clear session
-      _sessionId = null;
-      await _secureStorage.delete(key: _sessionKey);
-      await _secureStorage.delete(key: _authTimeKey);
+      // Clear local session data AFTER successful sign out
+      await _clearSessionData();
+      await clearStoredCredentials(); // Clear email/token etc.
 
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error during sign out',
-          error: e, stackTrace: stackTrace);
-
-      throw AuthException(
-        message: 'An error occurred while signing out. Please try again.',
-        code: 'signout_error',
-      );
+      Logger.error(_tag, 'Error during sign out: $e\n$stackTrace');
+      // Don't throw AuthException if sign out itself failed, maybe just log?
+      // Or rethrow a generic exception if needed by UI
+      // throw AuthException( message: 'An error occurred while signing out.', code: 'signout_error');
     }
   }
 
-  // Password reset
   Future<void> sendPasswordResetEmail(String email) async {
+    // Validate email format client-side first?
+    if (!_isValidEmail(email)) {
+      throw AuthException(message: 'Invalid email format.', code: 'invalid-email');
+    }
     try {
-      // Sanitize email for logging
       final maskedEmail = _maskEmail(email);
-      AdvancedLogger.info(_tag, 'Sending password reset email',
-          data: {'email': maskedEmail});
+      Logger.info(_tag, 'Sending password reset email to: $maskedEmail');
 
       await _auth.sendPasswordResetEmail(email: email);
 
-      AdvancedLogger.info(_tag, 'Password reset email sent successfully');
+      Logger.info(_tag, 'Password reset email sent successfully to $maskedEmail');
     } on FirebaseAuthException catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Firebase Auth Error sending reset email',
-          error: e, stackTrace: stackTrace,
-          data: {'code': e.code, 'message': e.message});
-
+      Logger.error(_tag, 'Firebase Auth Error sending reset email to $email: ${e.code}\n$stackTrace');
       throw AuthException(
-        message: _getReadableErrorMessage(e),
-        code: e.code,
+        message: _getReadableErrorMessage(e), // Use readable message
+        code: e.code, // Propagate original code
         isRecoverable: _isRecoverableError(e.code),
       );
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error sending password reset email',
-          error: e, stackTrace: stackTrace);
-
+      Logger.error(_tag, 'Error sending password reset email to $email: $e\n$stackTrace');
       throw AuthException(
-        message: 'An error occurred while sending the password reset email. Please try again.',
+        message: 'An error occurred sending the password reset email. Please try again.',
         code: 'reset_email_error',
       );
     }
   }
 
-  // Get user profile
+  // Simple email validation helper
+  bool _isValidEmail(String email) {
+    // Basic regex, consider using a package for more robust validation if needed
+    return RegExp(r"^[a-zA-Z0-9.a-zA-Z0-9.!#$%&'*+-/=?^_`{|}~]+@[a-zA-Z0-9]+\.[a-zA-Z]+").hasMatch(email);
+  }
+
+
+  // ==========================================================================
+  // USER PROFILE METHODS
+  // ==========================================================================
+
   Future<Map<String, dynamic>?> getUserProfile() async {
-    try {
-      if (currentUser != null) {
-        final doc = await _firestore.collection('users').doc(currentUser!.uid).get();
-
-        if (doc.exists) {
-          AdvancedLogger.info(_tag, 'User profile retrieved successfully');
-          return doc.data();
-        } else {
-          AdvancedLogger.warning(_tag, 'User profile document not found',
-              data: {'uid': currentUser!.uid});
-          return null;
-        }
-      }
-
-      AdvancedLogger.warning(_tag, 'No current user, cannot retrieve profile');
+    final user = currentUser; // Use getter
+    if (user == null) {
+      Logger.warning(_tag, 'No current user, cannot retrieve profile.');
       return null;
-    } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error getting user profile',
-          error: e, stackTrace: stackTrace);
+    }
 
+    try {
+      final doc = await _firestore.collection('users').doc(user.uid).get();
+      if (doc.exists) {
+        Logger.info(_tag, 'User profile retrieved successfully for ${user.uid}');
+        return doc.data();
+      } else {
+        // This case might indicate an issue (like signup profile save failure)
+        Logger.warning(_tag, 'User profile document not found in Firestore for UID: ${user.uid}');
+        return null;
+      }
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error getting user profile for ${user.uid}: $e\n$stackTrace');
+      // Throw specific exception?
       throw AuthException(
-        message: 'Failed to retrieve user profile. Please try again.',
+        message: 'Failed to retrieve user profile. Please try again later.',
         code: 'profile_retrieval_error',
       );
     }
   }
 
-  // Update user profile
   Future<void> updateUserProfile(Map<String, dynamic> data) async {
+    final user = currentUser;
+    if (user == null) {
+      Logger.warning(_tag, 'No current user, cannot update profile');
+      throw AuthException( message: 'You must be signed in to update your profile.', code: 'not_authenticated');
+    }
+
     try {
-      if (currentUser != null) {
-        // Add last updated timestamp
-        data['lastUpdated'] = FieldValue.serverTimestamp();
+      // Add last updated timestamp
+      data['lastUpdated'] = FieldValue.serverTimestamp();
 
-        await _firestore.collection('users').doc(currentUser!.uid).update(data);
+      await _firestore.collection('users').doc(user.uid).update(data);
+      Logger.info(_tag, 'User profile updated successfully for ${user.uid} with fields: ${data.keys.toList()}');
 
-        AdvancedLogger.info(_tag, 'User profile updated successfully',
-            data: {'updatedFields': data.keys.toList()});
-
-        // Update display name if provided
-        if (data.containsKey('name')) {
-          await currentUser!.updateDisplayName(data['name']);
-          AdvancedLogger.info(_tag, 'Display name updated');
+      // Update display name if provided ('name' key)
+      if (data.containsKey('name') && data['name'] is String) {
+        try {
+          await user.updateDisplayName(data['name']);
+          Logger.info(_tag, 'Display name updated for ${user.uid}');
+        } catch (e) {
+          Logger.warning(_tag, 'Failed to update display name for ${user.uid}: $e');
         }
-
-        // Log profile update event
-        await _logAuthEvent(currentUser!.uid, 'profile_update', {
-          'updatedFields': data.keys.toList(),
-        });
-      } else {
-        AdvancedLogger.warning(_tag, 'No current user, cannot update profile');
-        throw AuthException(
-          message: 'You must be signed in to update your profile.',
-          code: 'not_authenticated',
-        );
       }
-    } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error updating user profile',
-          error: e, stackTrace: stackTrace);
 
-      throw AuthException(
-        message: 'Failed to update user profile. Please try again.',
-        code: 'profile_update_error',
-      );
+      // Log profile update event (best effort)
+      try {
+        await _logAuthEvent(user.uid, 'profile_update', { 'updatedFields': data.keys.toList() });
+      } catch(e) {
+        Logger.error(_tag, 'Failed to log profile update event for ${user.uid}: $e');
+      }
+
+    } catch (e, stackTrace) {
+      Logger.error(_tag, 'Error updating user profile for ${user.uid}: $e\n$stackTrace');
+      // Check for specific Firestore errors (e.g., permission denied)
+      if (e is FirebaseException && e.code == 'permission-denied') {
+        throw AuthException(message: 'Permission denied to update profile.', code: e.code);
+      }
+      throw AuthException( message: 'Failed to update user profile. Please try again.', code: 'profile_update_error');
     }
   }
 
-  // PERSISTENT AUTHENTICATION METHODS
+  // ==========================================================================
+  // PERSISTENT AUTH / CREDENTIALS / HELPERS
+  // ==========================================================================
 
-  /// Check if the user has valid credentials stored
   Future<bool> hasValidCredentials() async {
+    // This seems more about checking if a user session *might* be resumable
     try {
-      final currentUser = _auth.currentUser;
-
-      // If user is already logged in through Firebase, they're authenticated
+      // If user object exists in auth state, check session validity
       if (currentUser != null) {
-        AdvancedLogger.info(_tag, 'User already authenticated in Firebase',
-            data: {'uid': currentUser.uid});
+        Logger.info(_tag, 'User authenticated via Firebase state: ${currentUser!.uid}');
+        // Combine checks: standard session AND freemium session (if applicable)
+        final bool standardSessionOk = await isAuthSessionValid();
+        final bool freemiumSessionOk = await isSessionValid(); // Checks premium status internally
 
-        // Check if session is still valid
-        if (!(await isSessionValid())) {
-          AdvancedLogger.warning(_tag, 'Auth session expired, forcing re-login');
-          await _auth.signOut();
+        if (!standardSessionOk) {
+          Logger.warning(_tag, 'Standard auth session expired, forcing sign out.');
+          await signOut(); // Sign out if main session expired
           return false;
         }
-
-        return true;
+        if (!freemiumSessionOk) {
+          // Only sign out if freemium expired AND they are not premium
+          final isPremium = await _isPremiumUser(currentUser!.uid);
+          if (!isPremium) {
+            Logger.warning(_tag, 'Freemium session expired, forcing sign out.');
+            await signOut();
+            return false;
+          }
+        }
+        return true; // Both sessions OK (or premium)
       }
 
-      // Check for stored token (for future non-Firebase auth options)
+      // Fallback: Check stored credentials (e.g., for 'Remember Me')
+      final bool rememberMe = await _isRememberMeEnabled();
+      final String? storedEmail = await _secureStorage.read(key: _emailKey);
+
+      if (rememberMe && storedEmail != null) {
+        Logger.info(_tag, 'Found stored email (${_maskEmail(storedEmail)}) for re-authentication hint.');
+        // Indicate that login is required, but we have credentials to pre-fill
+        return false; // Requires manual login
+      }
+
+      // Check for legacy token? (Seems less relevant if using Firebase Auth primarily)
+      /*
       final token = await _secureStorage.read(key: _tokenKey);
-      if (token != null) {
-        AdvancedLogger.info(_tag, 'Found stored authentication token');
+      if (token != null) { ... verify token ... }
+      */
 
-        // Here you could verify the token with your backend
-        // and refresh it if needed
+      Logger.info(_tag, 'No valid Firebase session or stored credentials found.');
+      return false; // No valid session or credentials found
 
-        // For now, we'll still check session validity
-        if (!(await isSessionValid())) {
-          AdvancedLogger.warning(_tag, 'Stored token session expired');
-          await clearStoredCredentials();
-          return false;
-        }
-
-        return true;
-      }
-
-      // Check if we have stored credentials and remember me is enabled
-      final isRememberMeEnabled = await _isRememberMeEnabled();
-      if (isRememberMeEnabled) {
-        final email = await _secureStorage.read(key: _emailKey);
-
-        if (email != null) {
-          // Sanitize email for logging
-          final maskedEmail = _maskEmail(email);
-          AdvancedLogger.info(_tag, 'Found stored email, prompting for re-authentication',
-              data: {'email': maskedEmail});
-
-          // Return false to indicate manual login is required
-          // But we'll pre-fill the email field for convenience
-          return false;
-        }
-      }
-
-      return false;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error checking credentials',
-          error: e, stackTrace: stackTrace);
-      return false;
+      Logger.error(_tag, 'Error checking credentials: $e\n$stackTrace');
+      return false; // Default to false on error
     }
   }
 
-  /// Save user email for auto-fill if remember me is enabled
   Future<void> saveCredentials(String email, bool rememberMe) async {
     try {
-      // Always save the remember me preference
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_rememberMeKey, rememberMe);
 
       if (rememberMe) {
-        // Sanitize email for logging
         final maskedEmail = _maskEmail(email);
-        AdvancedLogger.info(_tag, 'Saving email for later use',
-            data: {'email': maskedEmail});
-
-        // Save email in secure storage
+        Logger.info(_tag, 'Saving email for remember me: $maskedEmail');
         await _secureStorage.write(key: _emailKey, value: email);
 
-        // If using Firebase Auth, also save the refresh token if available
-        final currentUser = _auth.currentUser;
-        if (currentUser != null) {
-          final idTokenResult = await currentUser.getIdTokenResult();
+        // Storing Firebase ID token directly might have security implications
+        // and they expire. Refresh tokens are handled internally by SDK.
+        // Consider if storing the token is necessary for your use case.
+        /*
+        final user = currentUser;
+        if (user != null) {
+          final idTokenResult = await user.getIdTokenResult(true); // Force refresh?
           if (idTokenResult.token != null) {
             await _secureStorage.write(key: _tokenKey, value: idTokenResult.token);
-            AdvancedLogger.info(_tag, 'Saved authentication token');
+            Logger.info(_tag, 'Saved authentication token');
           }
         }
+        */
       } else {
-        // If remember me is disabled, clear any stored credentials
-        await clearStoredCredentials();
+        Logger.info(_tag, 'Remember me disabled, clearing stored email.');
+        await _secureStorage.delete(key: _emailKey);
+        // Also clear token if you were storing it
+        // await _secureStorage.delete(key: _tokenKey);
       }
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error saving credentials',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error saving credentials: $e\n$stackTrace');
     }
   }
 
-  /// Clear all stored credentials
   Future<void> clearStoredCredentials() async {
+    // Clears credentials potentially used for 'Remember Me'
     try {
-      AdvancedLogger.info(_tag, 'Clearing stored credentials');
-
-      await _secureStorage.delete(key: _tokenKey);
-      await _secureStorage.delete(key: _refreshTokenKey);
+      Logger.info(_tag, 'Clearing stored credentials (email/token)');
       await _secureStorage.delete(key: _emailKey);
-      await _secureStorage.delete(key: 'temp_password_hash');
-      await _secureStorage.delete(key: 'temp_salt');
-      // Don't delete the salt as it's used for password hashing
+      await _secureStorage.delete(key: _tokenKey); // If storing token
+      await _secureStorage.delete(key: _refreshTokenKey); // If storing refresh token (unlikely needed)
 
-      // Do not clear the remember me preference itself
-      AdvancedLogger.info(_tag, 'Credentials cleared successfully');
+      // Clear temporary hashes if used elsewhere (consider if needed)
+      // await _secureStorage.delete(key: 'temp_password_hash');
+      // await _secureStorage.delete(key: 'temp_salt');
+
+      // Keep the main salt used for password hashing if needed globally?
+      // await _secureStorage.delete(key: _saltKey); // Decide if salt is user-specific or global
+
+      // Note: Doesn't clear SharedPreferences (_rememberMeKey itself)
+
+      Logger.info(_tag, 'Stored credentials cleared.');
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error clearing credentials',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error clearing credentials: $e\n$stackTrace');
     }
   }
 
-  /// Check if remember me is enabled
   Future<bool> _isRememberMeEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       return prefs.getBool(_rememberMeKey) ?? false;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error reading remember me preference',
-          error: e, stackTrace: stackTrace);
-      return false;
+      Logger.error(_tag, 'Error reading remember me preference: $e\n$stackTrace');
+      return false; // Default to false on error
     }
   }
 
-  /// Check if biometric authentication is enabled
   Future<bool> isBiometricEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       return prefs.getBool(_biometricEnabledKey) ?? false;
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error reading biometric preference',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error reading biometric preference: $e\n$stackTrace');
       return false;
     }
   }
 
-  /// Enable or disable biometric authentication
   Future<void> setBiometricEnabled(bool enabled) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_biometricEnabledKey, enabled);
-
-      AdvancedLogger.info(_tag, 'Biometric authentication setting updated',
-          data: {'enabled': enabled});
+      Logger.info(_tag, 'Biometric authentication setting updated to: $enabled');
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error setting biometric preference',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error setting biometric preference: $e\n$stackTrace');
+      // Optionally throw or handle
     }
   }
 
-  /// Generate a secure salt for password hashing
+  // Password hashing/salt methods - seem okay but ensure salt management strategy is correct
   Future<void> _generateAndStoreSalt() async {
     try {
       final random = Random.secure();
@@ -1076,14 +1349,12 @@ class AuthService {
 
       await _secureStorage.write(key: _saltKey, value: salt);
 
-      AdvancedLogger.info(_tag, 'Generated and stored new salt for password hashing');
+      Logger.info(_tag, 'Generated and stored new salt for password hashing');
     } catch (e, stackTrace) {
-      AdvancedLogger.error(_tag, 'Error generating salt',
-          error: e, stackTrace: stackTrace);
+      Logger.error(_tag, 'Error generating salt: $e\n$stackTrace');
     }
   }
 
-  /// Get existing salt or create a new one
   Future<String> _getOrCreateSalt() async {
     final existingSalt = await _secureStorage.read(key: _saltKey);
     if (existingSalt != null) {
@@ -1095,48 +1366,36 @@ class AuthService {
     return await _secureStorage.read(key: _saltKey) ?? '';
   }
 
-  /// Hash the password with the salt using SHA-256
   String _hashPassword(String password, String salt) {
     final combinedBytes = utf8.encode(password + salt);
     final hash = sha256.convert(combinedBytes);
     return hash.toString();
   }
 
-  /// Mask email for logging
+  // Email masking - seems okay
   String _maskEmail(String email) {
-    final parts = email.split('@');
-    if (parts.length == 2) {
-      final username = parts[0];
-      final domain = parts[1];
-
-      // Keep first 3 chars of username and mask the rest
-      final maskedUsername = username.length <= 3
-          ? username
-          : '${username.substring(0, 3)}${'*' * (username.length - 3)}';
-
-      return '$maskedUsername@$domain';
+    try {
+      final parts = email.split('@');
+      if (parts.length == 2) {
+        final username = parts[0];
+        final domain = parts[1];
+        final maskedUsername = username.length <= 3
+            ? username
+            : '${username.substring(0, 3)}${'*' * (username.length - 3)}';
+        return '$maskedUsername@$domain';
+      }
+      return email;
+    } catch (_) {
+      return 'invalid.email.format';
     }
-    return email;
   }
 
-  /// For testing: Get password from user - NOT USED in production
+  // Placeholder methods - kept as provided
   Future<String> _getPasswordFromUser() async {
-    // This is just a placeholder method to make the code compile
-    // In a real app, you would have a UI prompt for the password
-    // or some secure way to store and retrieve it
-    throw AuthException(
-      message: 'This method is not implemented in production',
-      code: 'not_implemented',
-    );
+    throw AuthException(message: 'Not implemented', code: 'not_implemented');
   }
 
-  /// For testing: Complete sign-in - NOT USED in production
   Future<UserCredential> completeSignIn(String? verificationCode) async {
-    // This is just a placeholder method to make the code compile
-    // In a real app, this would be implemented differently
-    throw AuthException(
-      message: 'This method is not implemented in production',
-      code: 'not_implemented',
-    );
+    throw AuthException(message: 'Not implemented', code: 'not_implemented');
   }
 }

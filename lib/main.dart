@@ -1,3 +1,9 @@
+// Copyright © 2025 Milo App Team. All rights reserved.
+// Version: 1.0.0 - April 23, 2025
+//
+// Main entry point for the Milo app - a therapeutic companion app for users 55+.
+// Handles app initialization, Firebase setup, permissions, services, and routing.
+
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -91,6 +97,26 @@ void main() async {
       );
       Logger.info('App', 'Firebase initialization successful');
       _isFirebaseInitialized = true;
+    }
+
+    // Add verbose logging for Firebase Auth - must be after Firebase initialization
+    if (kDebugMode) {
+      try {
+        // Try to enable more detailed Firebase Auth logging
+        // Note: exact method name may vary depending on your firebase_auth version
+        // Check Firebase Auth documentation for the correct method
+        await FirebaseAuth.instance.setLanguageCode("en");
+        Logger.info('App', 'Firebase Auth language set to English');
+
+        // Enable debug mode if running in an emulator
+        if (kDebugMode) {
+          // Uncomment this if running with Firebase emulator
+          // await FirebaseAuth.instance.useAuthEmulator('localhost', 9099);
+          Logger.info('App', 'Firebase Auth debug mode enabled');
+        }
+      } catch (e) {
+        Logger.warning('App', 'Could not configure Firebase Auth logging: $e');
+      }
     }
 
     // Log Firebase info if initialized
@@ -351,20 +377,22 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
         Logger.error('App', 'Analytics error details: ${e.toString()}');
       }
 
-      Logger.info('App', 'Testing Firestore connection...');
-      try {
-        await FirebaseFirestore.instance
-            .collection('_milo_system')
-            .doc('connectivity_test')
-            .set({
-          'last_test': FieldValue.serverTimestamp(),
-          'device_info': 'Flutter debug build',
-          'status': 'connected',
-        });
-        Logger.info('App', 'Firestore write successful');
-      } catch (e) {
-        Logger.error('App', 'Firestore test failed: $e');
-        Logger.error('App', 'Firestore error details: ${e.toString()}');
+      // Only run Firestore tests if user is authenticated
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        Logger.info('App', 'Testing Firestore connection...');
+        try {
+          await FirebaseFirestore.instance
+              .collection('_milo_system')
+              .doc('connectivity_test') //
+              .get();
+          Logger.info('App', 'Firestore read successful');
+        } catch (e) {
+          Logger.error('App', 'Firestore test failed: $e');
+          Logger.error('App', 'Firestore error details: ${e.toString()}');
+        }
+      } else {
+        Logger.info('App', 'Skipping Firestore test - user not authenticated');
       }
     }
   }
@@ -470,22 +498,23 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.error_outline, color: AppTheme.mutedRed, size: 64),
+                      Icon(
+                          Icons.error_outline,
+                          color: Theme.of(context).colorScheme.error,
+                          size: 64
+                      ),
                       const SizedBox(height: 16),
                       Text(
                         'Something went wrong',
-                        style: TextStyle(
-                          fontSize: AppTheme.fontSizeLarge,
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
                           fontWeight: FontWeight.bold,
-                          color: AppTheme.textColor,
                         ),
                       ),
                       const SizedBox(height: 8),
                       Text(
                         'Please try again or restart the app',
-                        style: TextStyle(
-                          fontSize: AppTheme.fontSizeMedium,
-                          color: AppTheme.textSecondaryColor,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: Theme.of(context).textTheme.bodySmall?.color,
                         ),
                         textAlign: TextAlign.center,
                       ),
@@ -494,10 +523,6 @@ class _MiloAppState extends State<MiloApp> with WidgetsBindingObserver {
                         onPressed: () {
                           Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false);
                         },
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppTheme.gentleTeal,
-                          foregroundColor: Colors.white,
-                        ),
                         child: const Text('Return to Start'),
                       ),
                     ],

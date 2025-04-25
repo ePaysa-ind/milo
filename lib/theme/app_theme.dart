@@ -57,6 +57,12 @@ class AppTheme {
   static const EdgeInsets paddingMedium = EdgeInsets.all(spacingMedium);
   static const EdgeInsets paddingLarge = EdgeInsets.all(spacingLarge);
 
+  // Create standard border radius objects for easy access
+  static final BorderRadius smallBorderRadius = BorderRadius.circular(borderRadiusSmall);
+  static final BorderRadius mediumBorderRadius = BorderRadius.circular(borderRadiusMedium);
+  static final BorderRadius largeBorderRadius = BorderRadius.circular(borderRadiusLarge);
+  static final BorderRadius circularBorderRadius = BorderRadius.circular(borderRadiusCircular);
+
   /// The main ThemeData for the app
   static ThemeData get theme {
     return ThemeData(
@@ -66,13 +72,13 @@ class AppTheme {
       colorScheme: ColorScheme.light(
         primary: gentleTeal,
         secondary: calmBlue,
+        surface: cardColor,
         background: backgroundColor,
         error: errorColor,
-        surface: cardColor,
         onPrimary: Colors.white,
         onSecondary: Colors.white,
-        onBackground: textColor,
         onSurface: textColor,
+        onBackground: textColor,
         onError: Colors.white,
       ),
 
@@ -124,6 +130,16 @@ class AppTheme {
           fontWeight: FontWeight.w500,
           color: textColor,
         ),
+        titleLarge: TextStyle(
+          fontSize: fontSizeLarge,
+          fontWeight: FontWeight.bold,
+          color: textColor,
+        ),
+        titleMedium: TextStyle(
+          fontSize: fontSizeMedium,
+          fontWeight: FontWeight.w500,
+          color: textColor,
+        ),
       ),
 
       // Button themes
@@ -133,7 +149,7 @@ class AppTheme {
           foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(borderRadiusMedium),
+            borderRadius: mediumBorderRadius,
           ),
           textStyle: const TextStyle(
             fontSize: fontSizeMedium,
@@ -159,19 +175,19 @@ class AppTheme {
         fillColor: Colors.white,
         contentPadding: const EdgeInsets.all(16),
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(borderRadiusMedium),
+          borderRadius: mediumBorderRadius,
           borderSide: BorderSide(color: gentleTeal.withOpacity(0.5)),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(borderRadiusMedium),
+          borderRadius: mediumBorderRadius,
           borderSide: BorderSide(color: gentleTeal.withOpacity(0.5)),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(borderRadiusMedium),
+          borderRadius: mediumBorderRadius,
           borderSide: const BorderSide(color: gentleTeal, width: 2.0),
         ),
         errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(borderRadiusMedium),
+          borderRadius: mediumBorderRadius,
           borderSide: const BorderSide(color: errorColor),
         ),
         hintStyle: TextStyle(
@@ -194,7 +210,7 @@ class AppTheme {
         color: cardColor,
         elevation: 2,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(borderRadiusMedium),
+          borderRadius: mediumBorderRadius,
         ),
         margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
       ),
@@ -215,9 +231,59 @@ class AppTheme {
         ),
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(borderRadiusSmall),
+          borderRadius: smallBorderRadius,
+        ),
+      ),
+
+      // Dialog theme
+      dialogTheme: DialogTheme(
+        shape: RoundedRectangleBorder(
+          borderRadius: largeBorderRadius,
+        ),
+        backgroundColor: backgroundColor,
+        elevation: 4,
+        titleTextStyle: const TextStyle(
+          fontSize: fontSizeLarge,
+          fontWeight: FontWeight.bold,
+          color: textColor,
+        ),
+        contentTextStyle: const TextStyle(
+          fontSize: fontSizeMedium,
+          color: textColor,
+        ),
+      ),
+
+      // PopupMenu theme
+      popupMenuTheme: PopupMenuThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: mediumBorderRadius,
+        ),
+        elevation: 4,
+        textStyle: const TextStyle(
+          fontSize: fontSizeMedium,
+          color: textColor,
         ),
       ),
     );
+  }
+
+  // Helper methods to get border radius for different components
+  static BorderRadius getBorderRadiusForCard() => mediumBorderRadius;
+  static BorderRadius getBorderRadiusForButton() => mediumBorderRadius;
+  static BorderRadius getBorderRadiusForTextField() => mediumBorderRadius;
+  static BorderRadius getBorderRadiusForDialog() => largeBorderRadius;
+  static BorderRadius getBorderRadiusForAlert() => mediumBorderRadius;
+
+  // Helper method for getting values from shapes
+  static BorderRadius? getShapeBorderRadius(ShapeBorder? shape) {
+    if (shape is RoundedRectangleBorder) {
+      return shape.borderRadius as BorderRadius?;
+    }
+    return null;
+  }
+
+  // Helper method to get radius value
+  static double getRadiusValue(BorderRadius? radius) {
+    return radius?.topLeft.x ?? borderRadiusMedium;
   }
 }

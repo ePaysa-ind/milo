@@ -1,3 +1,5 @@
+//lib/screens/login_screen.dart
+
 import 'package:flutter/material.dart';
 import 'package:milo/services/auth_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -33,6 +35,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
   bool _obscurePassword = true;
 
   Timer? _infoMessageTimer;
+  Timer? _sessionTimer; // Added session timer
   bool _isMounted = false;
 
   @override
@@ -40,6 +43,9 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
     super.initState();
     _isMounted = true;
     Logger.info('LoginScreen', 'Initializing LoginScreen');
+
+    // Reset failed login attempts counter to prevent lockout issues
+    AuthService().resetLoginAttempts();
 
     // Register for app lifecycle events
     WidgetsBinding.instance.addObserver(this);
@@ -60,6 +66,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
     // If the app is resumed and we're still mounted, check if biometrics are still valid
     if (state == AppLifecycleState.resumed && _isMounted) {
       _checkBiometricAvailability();
+      _checkSessionValidity(); // Added session validity check on app resume
     }
   }
 
@@ -72,6 +79,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
 
     // Cancel any pending timers
     _infoMessageTimer?.cancel();
+    _sessionTimer?.cancel(); // Cancel session timer on dispose
 
     // Dispose of controllers
     _emailController.dispose();
@@ -81,6 +89,58 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
 
     super.dispose();
+  }
+
+  // New method to check session validity
+  Future<void> _checkSessionValidity() async {
+    if (!_isMounted) return;
+
+    try {
+      final isSessionValid = await _authService.isSessionValid();
+      if (!isSessionValid) {
+        // Session expired, log user out
+        await _endSession(showMessage: true);
+      }
+    } catch (e) {
+      Logger.error('LoginScreen', 'Error checking session validity: $e');
+    }
+  }
+
+  // New method to start session timer
+  void _startSessionTimer() {
+    // Cancel any existing timer first
+    _sessionTimer?.cancel();
+
+    Logger.info('LoginScreen', 'Starting 5-minute session timer');
+
+    // Create new timer for 5 minutes (300 seconds)
+    _sessionTimer = Timer(const Duration(seconds: 300), () async {
+      if (_isMounted && mounted && !_isDisposed) {
+        Logger.info('LoginScreen', 'Session timer expired, ending session');
+        await _endSession(showMessage: true);
+      }
+    });
+  }
+
+  // New method to end session
+  Future<void> _endSession({bool showMessage = false}) async {
+    if (!_isMounted) return;
+
+    try {
+      Logger.info('LoginScreen', 'Ending user session');
+
+      // Cancel session timer
+      _sessionTimer?.cancel();
+
+      // Sign out user
+      await _authService.signOut();
+
+      if (showMessage && _isMounted && mounted && !_isDisposed) {
+        _showSnackbar('Your freemium session has ended. Please log in again.');
+      }
+    } catch (e) {
+      Logger.error('LoginScreen', 'Error ending session: $e');
+    }
   }
 
   // Safe setState that checks if the widget is still mounted and not disposed
@@ -132,8 +192,22 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
       if (hasValidCredentials) {
         Logger.info('LoginScreen', 'Found valid credentials, auto-logging in');
 
-        // If we're still mounted, navigate to home
+        // Check login limit before allowing auto-login
+        final hasReachedLimit = await _authService.hasReachedLoginLimit();
+        if (hasReachedLimit) {
+          Logger.info('LoginScreen', 'User has reached free login limit');
+
+          _safeSetState(() {
+            _errorMessage = 'You have reached your free login limit. Please upgrade to premium.';
+            _isLoading = false;
+          });
+          return;
+        }
+
+        // If we're still mounted, track login and navigate to home
         if (_isMounted && mounted && !_isDisposed) {
+          await _authService.trackLogin();
+          _startSessionTimer(); // Start session timer after successful login
           Navigator.pushReplacementNamed(context, '/home');
           return; // Exit early after navigation
         }
@@ -209,6 +283,16 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
         if (_biometricsAvailable && await _authService.hasValidCredentials()) {
           if (!_isMounted) return;
 
+          // Check login limit before offering biometric login
+          final hasReachedLimit = await _authService.hasReachedLoginLimit();
+          if (hasReachedLimit) {
+            Logger.info('LoginScreen', 'User has reached free login limit');
+            _safeSetState(() {
+              _errorMessage = 'You have reached your free login limit. Please upgrade to premium.';
+            });
+            return;
+          }
+
           // Small delay to ensure UI is ready
           Future.delayed(const Duration(milliseconds: 500), () {
             if (_isMounted && mounted && !_isDisposed) {
@@ -234,6 +318,14 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
     try {
       Logger.info('LoginScreen', 'Starting biometric authentication');
 
+      // Check login limit before attempting biometric login
+      final hasReachedLimit = await _authService.hasReachedLoginLimit();
+      if (hasReachedLimit) {
+        Logger.info('LoginScreen', 'User has reached free login limit');
+        _showSnackbar('You have reached your free login limit. Please upgrade to premium.');
+        return;
+      }
+
       final authenticated = await _localAuth.authenticate(
         localizedReason: 'Login to Milo with your biometric',
         options: const AuthenticationOptions(
@@ -250,6 +342,12 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
         _safeSetState(() {
           _isLoading = true;
         });
+
+        // Track login after successful biometric authentication
+        await _authService.trackLogin();
+
+        // Start session timer
+        _startSessionTimer();
 
         // Navigate to home screen if still mounted
         Logger.info('LoginScreen', 'Biometric auth successful, navigating to home');
@@ -286,10 +384,10 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
           message,
           style: TextStyle(fontSize: AppTheme.fontSizeSmall),
         ),
-        backgroundColor: isError ? AppTheme.mutedRed : AppTheme.calmGreen,
+        backgroundColor: isError ? AppTheme.errorColor : AppTheme.successColor,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTheme.borderRadiusSmall),
+          borderRadius: AppTheme.smallBorderRadius,
         ),
         duration: const Duration(seconds: 4),
       ),
@@ -315,12 +413,30 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
 
       Logger.info('LoginScreen', 'Initiating login with email: ${email.split('@').first}@***');
 
+      // Check login limit before attempting login
+      final hasReachedLimit = await _authService.hasReachedLoginLimit();
+      if (hasReachedLimit) {
+        Logger.info('LoginScreen', 'User has reached free login limit');
+
+        _safeSetState(() {
+          _isLoading = false;
+          _errorMessage = 'You have reached your free login limit. Please upgrade to premium.';
+        });
+        return;
+      }
+
       // Use the two-step authentication process
       try {
         // First step: initiate sign-in (validate credentials)
         await _authService.initiateSignIn(email, password);
 
         if (!_isMounted) return;
+
+        // Track login after successful authentication
+        await _authService.trackLogin();
+
+        // Start session timer
+        _startSessionTimer();
 
         // Save email if remember me is checked
         await _authService.saveCredentials(email, _rememberMe);
@@ -423,7 +539,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
           onTap: () => FocusScope.of(context).unfocus(),
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24.0),
+              padding: AppTheme.paddingLarge,
               child: Form(
                 key: _formKey,
                 child: Column(
@@ -444,26 +560,26 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 32),
+                    SizedBox(height: AppTheme.spacingLarge),
 
                     // Info message (success/information alerts)
                     if (_infoMessage != null)
                       Container(
-                        padding: const EdgeInsets.all(12),
+                        padding: AppTheme.paddingSmall,
                         decoration: BoxDecoration(
-                          color: AppTheme.calmGreen.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
-                          border: Border.all(color: AppTheme.calmGreen),
+                          color: AppTheme.successColor.withOpacity(0.1),
+                          borderRadius: AppTheme.mediumBorderRadius,
+                          border: Border.all(color: AppTheme.successColor),
                         ),
                         child: Row(
                           children: [
-                            Icon(Icons.info_outline, color: AppTheme.calmGreen),
-                            const SizedBox(width: 12),
+                            Icon(Icons.info_outline, color: AppTheme.successColor),
+                            SizedBox(width: AppTheme.spacingSmall),
                             Expanded(
                               child: Text(
                                 _infoMessage!,
                                 style: TextStyle(
-                                  color: AppTheme.calmGreen,
+                                  color: AppTheme.successColor,
                                   fontSize: AppTheme.fontSizeSmall,
                                 ),
                               ),
@@ -475,22 +591,22 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                     // Error message (place at top for visibility)
                     if (_errorMessage != null)
                       Container(
-                        padding: const EdgeInsets.all(12),
+                        padding: AppTheme.paddingSmall,
                         margin: const EdgeInsets.only(bottom: 16),
                         decoration: BoxDecoration(
-                          color: AppTheme.mutedRed.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
-                          border: Border.all(color: AppTheme.mutedRed),
+                          color: AppTheme.errorColor.withOpacity(0.1),
+                          borderRadius: AppTheme.mediumBorderRadius,
+                          border: Border.all(color: AppTheme.errorColor),
                         ),
                         child: Row(
                           children: [
-                            Icon(Icons.error_outline, color: AppTheme.mutedRed),
-                            const SizedBox(width: 12),
+                            Icon(Icons.error_outline, color: AppTheme.errorColor),
+                            SizedBox(width: AppTheme.spacingSmall),
                             Expanded(
                               child: Text(
                                 _errorMessage!,
                                 style: TextStyle(
-                                  color: AppTheme.mutedRed,
+                                  color: AppTheme.errorColor,
                                   fontSize: AppTheme.fontSizeSmall,
                                 ),
                               ),
@@ -499,7 +615,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                         ),
                       ),
 
-                    const SizedBox(height: 16),
+                    SizedBox(height: AppTheme.spacingSmall),
 
                     // Email field
                     TextFormField(
@@ -508,7 +624,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                         labelText: 'Email',
                         hintText: 'Enter your email address',
                         border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
+                          borderRadius: AppTheme.mediumBorderRadius,
                         ),
                         prefixIcon: const Icon(Icons.email),
                         contentPadding: const EdgeInsets.symmetric(
@@ -533,7 +649,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                       },
                       enabled: !_isLoading,
                     ),
-                    const SizedBox(height: 16),
+                    SizedBox(height: AppTheme.spacingSmall),
 
                     // Password field
                     TextFormField(
@@ -542,7 +658,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                         labelText: 'Password',
                         hintText: 'Enter your password',
                         border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
+                          borderRadius: AppTheme.mediumBorderRadius,
                         ),
                         prefixIcon: const Icon(Icons.lock),
                         suffixIcon: IconButton(
@@ -616,7 +732,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                       ),
                     ),
 
-                    const SizedBox(height: 24),
+                    SizedBox(height: AppTheme.spacingMedium),
 
                     // Login button
                     ElevatedButton(
@@ -626,7 +742,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                         foregroundColor: Colors.white,
                         padding: const EdgeInsets.symmetric(vertical: 16),
                         shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
+                          borderRadius: AppTheme.mediumBorderRadius,
                         ),
                         disabledBackgroundColor: AppTheme.gentleTeal.withOpacity(0.6),
                       ),
@@ -648,7 +764,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                       ),
                     ),
 
-                    const SizedBox(height: 24),
+                    SizedBox(height: AppTheme.spacingMedium),
 
                     // Sign up link
                     Center(
@@ -792,7 +908,7 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
               ),
             ),
             shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(AppTheme.borderRadiusLarge),
+              borderRadius: AppTheme.largeBorderRadius,
             ),
             content: Column(
               mainAxisSize: MainAxisSize.min,
@@ -804,14 +920,14 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                     color: AppTheme.textSecondaryColor,
                   ),
                 ),
-                const SizedBox(height: 16),
+                SizedBox(height: AppTheme.spacingSmall),
                 TextField(
                   controller: resetEmailController,
                   decoration: InputDecoration(
                     labelText: 'Email',
                     hintText: 'Enter your email',
                     border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppTheme.borderRadiusMedium),
+                      borderRadius: AppTheme.mediumBorderRadius,
                     ),
                     prefixIcon: const Icon(Icons.email),
                   ),
@@ -828,19 +944,19 @@ class _LoginScreenState extends State<LoginScreen> with WidgetsBindingObserver {
                     margin: const EdgeInsets.only(top: 12),
                     padding: const EdgeInsets.all(8),
                     decoration: BoxDecoration(
-                      color: AppTheme.mutedRed.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(AppTheme.borderRadiusSmall),
-                      border: Border.all(color: AppTheme.mutedRed.withOpacity(0.5)),
+                      color: AppTheme.errorColor.withOpacity(0.1),
+                      borderRadius: AppTheme.smallBorderRadius,
+                      border: Border.all(color: AppTheme.errorColor.withOpacity(0.5)),
                     ),
                     child: Row(
                       children: [
-                        Icon(Icons.error_outline, color: AppTheme.mutedRed, size: 16),
-                        const SizedBox(width: 8),
+                        Icon(Icons.error_outline, color: AppTheme.errorColor, size: 16),
+                        SizedBox(width: AppTheme.spacingSmall/1.5),
                         Expanded(
                           child: Text(
                             resetErrorMessage!,
                             style: TextStyle(
-                              color: AppTheme.mutedRed,
+                              color: AppTheme.errorColor,
                               fontSize: AppTheme.fontSizeSmall,
                             ),
                           ),
